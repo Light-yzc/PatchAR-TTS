@@ -366,9 +366,9 @@ def run_periodic_inference(
                 f"pred_frames={example.pred_frames}"
             )
 
-            logs[f"infer/prompt_frames_{sample_idx}"] = example.prompt_frames
-            logs[f"infer/target_frames_{sample_idx}"] = example.target_frames
-            logs[f"infer/pred_frames_{sample_idx}"] = example.pred_frames
+            # logs[f"infer/prompt_frames_{sample_idx}"] = example.prompt_frames
+            # logs[f"infer/target_frames_{sample_idx}"] = example.target_frames
+            # logs[f"infer/pred_frames_{sample_idx}"] = example.pred_frames
 
         # if wandb_run is not None and wandb is not None:
         #     table = wandb.Table(columns=["step", "sample_idx", "text", "prompt_frames", "target_frames", "pred_frames"])
