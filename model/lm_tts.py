@@ -18,7 +18,9 @@ class LMTTSLosses:
     loss: torch.Tensor
     lm_loss: torch.Tensor
     dit_loss: torch.Tensor
+    patch_lm_loss: torch.Tensor
     stop_head_loss: torch.Tensor
+    weighted_patch_lm_loss: torch.Tensor
     weighted_stop_loss: torch.Tensor
     weighted_moe_aux_loss: torch.Tensor
     diff_loss: torch.Tensor
@@ -142,6 +144,7 @@ class LMTTSModel(nn.Module):
         lm_config: MiniMindConfig,
         dit_config: DiTConfig,
         flow_config: FlowMatchingConfig | None = None,
+        patch_lm_loss_weight: float = 1.0,
         stop_loss_weight: float = 1.0,
         moe_aux_loss_weight: float = 1.0,
     ) -> None:
@@ -161,6 +164,7 @@ class LMTTSModel(nn.Module):
         self.patch_size = patch_size
         self.cond_tokens_per_patch = cond_tokens_per_patch
         self.max_chunk_size = patch_size
+        self.patch_lm_loss_weight = patch_lm_loss_weight
         self.stop_loss_weight = stop_loss_weight
         self.moe_aux_loss_weight = moe_aux_loss_weight
 
@@ -183,6 +187,13 @@ class LMTTSModel(nn.Module):
         # as DiT cross-attention memory for the current patch.
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
         self.cond_slot_embed = nn.Parameter(torch.randn(1, cond_tokens_per_patch, self.hidden_size) * 0.02)
+        # Explicit LM auxiliary head: predict the next target patch embedding under
+        # teacher forcing, instead of relying only on stop / DiT gradients.
+        self.patch_predictor = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
         self.stop_proj = nn.Linear(self.hidden_size, self.hidden_size)
         self.stop_act = nn.SiLU()
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -527,6 +538,14 @@ class LMTTSModel(nn.Module):
 
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
+        pred_target_patches = self.patch_predictor(target_patch_hidden)
+        patch_lm_loss_per_step = F.mse_loss(
+            pred_target_patches,
+            target_patches,
+            reduction="none",
+        ).mean(dim=-1)
+        patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
+
         stop_logits = self.stop_head(self.stop_act(self.stop_proj(target_patch_hidden)))
         stop_labels = self._build_stop_labels(target_patch_mask)
         stop_loss_per_step = self.stop_loss_fn(
@@ -552,9 +571,10 @@ class LMTTSModel(nn.Module):
             chunk_mask=chunk_masks,
         )
 
+        weighted_patch_lm_loss = self.patch_lm_loss_weight * patch_lm_loss
         weighted_stop_loss = self.stop_loss_weight * stop_loss
         weighted_moe_aux_loss = self.moe_aux_loss_weight * moe_aux_loss
-        lm_loss = weighted_stop_loss + weighted_moe_aux_loss
+        lm_loss = weighted_patch_lm_loss + weighted_stop_loss + weighted_moe_aux_loss
 
         total_loss = diff_loss + lm_loss
 
@@ -562,7 +582,9 @@ class LMTTSModel(nn.Module):
             loss=total_loss,
             lm_loss=lm_loss.detach(),
             dit_loss=diff_loss.detach(),
+            patch_lm_loss=patch_lm_loss.detach(),
             stop_head_loss=stop_loss.detach(),
+            weighted_patch_lm_loss=weighted_patch_lm_loss.detach(),
             weighted_stop_loss=weighted_stop_loss.detach(),
             weighted_moe_aux_loss=weighted_moe_aux_loss.detach(),
             diff_loss=diff_loss.detach(),

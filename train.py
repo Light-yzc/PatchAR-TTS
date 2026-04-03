@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import random
-import shutil
 import warnings
 from contextlib import nullcontext
 from functools import partial
@@ -203,6 +202,7 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         lm_config=lm_config,
         dit_config=dit_config,
         flow_config=flow_config,
+        patch_lm_loss_weight=train_cfg.get("patch_lm_loss_weight", 1.0),
         stop_loss_weight=train_cfg.get("stop_loss_weight", 1.0),
         moe_aux_loss_weight=train_cfg.get("moe_aux_loss_weight", 1.0),
     )
@@ -428,13 +428,17 @@ def save_checkpoint(
     scaler: GradScaler,
     cfg: dict,
     vocab_path: Path,
-    keep_last_k: int,
     wandb_run_id: str | None = None,
 ) -> Path:
-    """Save a full training checkpoint and trim old step directories."""
+    """Save a full training checkpoint.
+
+    Checkpoints are stored under `step_{global_step}/checkpoint.pt`.
+    If the same step is saved again, the file is simply overwritten in place.
+    """
     ckpt_dir = output_dir / f"step_{step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "checkpoint.pt"
+    tmp_ckpt_path = ckpt_dir / "checkpoint.pt.tmp"
     torch.save(
         {
             "global_step": step,
@@ -447,23 +451,9 @@ def save_checkpoint(
             "vocab_path": str(vocab_path),
             "wandb_run_id": wandb_run_id,
         },
-        ckpt_path,
+        tmp_ckpt_path,
     )
-
-    if keep_last_k > 0:
-        step_dirs = []
-        for path in output_dir.glob("step_*"):
-            if not path.is_dir():
-                continue
-            try:
-                step_value = int(path.name.split("_", 1)[1])
-            except (IndexError, ValueError):
-                continue
-            step_dirs.append((step_value, path))
-        step_dirs.sort(key=lambda item: item[0])
-        while len(step_dirs) > keep_last_k:
-            _, old_path = step_dirs.pop(0)
-            shutil.rmtree(old_path, ignore_errors=True)
+    tmp_ckpt_path.replace(ckpt_path)
 
     return ckpt_path
 
@@ -619,7 +609,6 @@ def train(args: argparse.Namespace) -> None:
     max_steps = int(train_cfg["max_steps"])
     max_epochs = int(train_cfg.get("epochs", 1_000_000))
     gradient_clip = float(train_cfg.get("gradient_clip", 1.0))
-    keep_last_k = int(train_cfg.get("keep_last_k", 2))
 
     model.train()
     progress_bar = tqdm(total=max_steps, initial=global_step, desc="Training")
@@ -666,7 +655,9 @@ def train(args: argparse.Namespace) -> None:
                     "train/loss": float(losses.loss.item()),
                     "train/lm_loss": float(losses.lm_loss.item()),
                     "train/dit_loss": float(losses.dit_loss.item()),
+                    "train/patch_lm_loss": float(losses.patch_lm_loss.item()),
                     "train/stop_head_loss": float(losses.stop_head_loss.item()),
+                    "train/weighted_patch_lm_loss": float(losses.weighted_patch_lm_loss.item()),
                     "train/weighted_stop_loss": float(losses.weighted_stop_loss.item()),
                     "train/weighted_moe_aux_loss": float(losses.weighted_moe_aux_loss.item()),
                     # "train/lm_moe_aux_loss": float(losses.moe_aux_loss.item()),
@@ -680,6 +671,7 @@ def train(args: argparse.Namespace) -> None:
                     f"epoch={epoch + 1} step={global_step} "
                     f"loss={metrics['train/loss']:.4f} "
                     f"lm={metrics['train/lm_loss']:.4f} "
+                    f"patch={metrics['train/patch_lm_loss']:.4f} "
                     f"dit={metrics['train/dit_loss']:.4f} "
                     f"stop={metrics['train/stop_head_loss']:.4f} "
                     f"moe_aux={metrics['train/moe_aux_loss']:.4f} "
@@ -714,7 +706,6 @@ def train(args: argparse.Namespace) -> None:
                     scaler=scaler,
                     cfg=cfg,
                     vocab_path=saved_vocab_path,
-                    keep_last_k=keep_last_k,
                     wandb_run_id=(wandb_run.id if wandb_run is not None else None),
                 )
                 print(f"Saved checkpoint to {ckpt_path}")
@@ -732,7 +723,6 @@ def train(args: argparse.Namespace) -> None:
         scaler=scaler,
         cfg=cfg,
         vocab_path=saved_vocab_path,
-        keep_last_k=max(keep_last_k, 1),
         wandb_run_id=(wandb_run.id if wandb_run is not None else None),
     )
     progress_bar.close()
