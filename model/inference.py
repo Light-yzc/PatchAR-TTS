@@ -45,6 +45,26 @@ def extract_masked_latents(latents_row: torch.Tensor, mask_row: torch.Tensor) ->
     return latents_row[mask_row]
 
 
+def trim_trailing_zero_latents(latent: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Remove trailing all-zero latent frames.
+
+    The dataset pads short utterances to `min_frames` with zeros before collation.
+    Those zeros are "valid" from the training mask perspective, but they are not
+    real audio content and can produce harsh artifacts when decoded by the VAE.
+    """
+    if latent.dim() != 2:
+        raise ValueError("Expected latent shape [T, D]")
+    if latent.shape[0] == 0:
+        return latent
+
+    nonzero = latent.abs().amax(dim=-1) > eps
+    if not torch.any(nonzero):
+        return latent[:0]
+    last_valid = int(nonzero.nonzero(as_tuple=False)[-1].item()) + 1
+    return latent[:last_valid]
+
+
 def decode_text_tokens(tokenizer: Any, input_ids_row: torch.Tensor, attention_mask_row: torch.Tensor) -> str:
     """Recover the visible text string from one padded token row."""
     valid_len = int(attention_mask_row.sum().item())
@@ -128,11 +148,13 @@ def build_inference_examples(
         prompt_latent = extract_masked_latents(
             batch["latent"][sample_idx],
             batch["prompt_mask"][sample_idx],
-        ).unsqueeze(0)
+        )
         target_latent = extract_masked_latents(
             batch["latent"][sample_idx],
             batch["target_mask"][sample_idx],
-        ).unsqueeze(0)
+        )
+        prompt_latent = trim_trailing_zero_latents(prompt_latent).unsqueeze(0)
+        target_latent = trim_trailing_zero_latents(target_latent).unsqueeze(0)
         pred_latent = run_autoregressive_inference(
             model=model,
             input_ids=batch["input_ids"][sample_idx : sample_idx + 1],
@@ -236,6 +258,7 @@ __all__ = [
     "build_inference_examples",
     "decode_text_tokens",
     "extract_masked_latents",
+    "trim_trailing_zero_latents",
     "run_autoregressive_inference",
     "save_inference_examples",
     "waveform_to_wandb_array",
