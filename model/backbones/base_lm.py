@@ -379,11 +379,18 @@ class MoEFeedForward(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
+        # Flatten tokens across batch/time so routing happens per token.
+        # x:      [B, T, H]
+        # flat_x: [B*T, H]
         flat_x = x.reshape(-1, hidden_dim)
 
+        # Router scores over experts for every token.
+        # router_logits / router_probs: [num_tokens, num_experts]
         router_logits = self.router(flat_x)
         router_probs = F.softmax(router_logits, dim=-1)
 
+        # For each token, keep only top-k experts.
+        # topk_weights / topk_experts: [num_tokens, top_k]
         topk_weights, topk_experts = torch.topk(
             router_probs,
             k=self.num_experts_per_tok,
@@ -393,25 +400,44 @@ class MoEFeedForward(nn.Module):
         if self.norm_topk_prob:
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
 
+        # Accumulate the weighted expert outputs back into the flattened token grid.
+        # output: [num_tokens, H]
         output = torch.zeros_like(flat_x)
 
         for expert_idx, expert in enumerate(self.experts):
+            # token_ids: which flattened tokens selected this expert
+            # route_ids: whether it was selected as top-1 / top-2 / ...
             token_ids, route_ids = (topk_experts == expert_idx).nonzero(as_tuple=True)
             if token_ids.numel() == 0:
                 continue
 
+            # expert_input:  [num_routed_tokens, H]
+            # expert_output: [num_routed_tokens, H]
             expert_input = flat_x.index_select(0, token_ids)
             expert_output = expert(expert_input)
+            # expert_weight: [num_routed_tokens, 1]
             expert_weight = topk_weights[token_ids, route_ids].unsqueeze(-1)
             output.index_add_(0, token_ids, expert_output * expert_weight)
 
         # Count every selected top-k route, not just the top-1 expert.
-        # Shape: [num_tokens, top_k, num_experts]
+        # selected_expert_mask: [num_tokens, top_k, num_experts]
         selected_expert_mask = F.one_hot(topk_experts, num_classes=self.num_experts).to(router_probs.dtype)
-        # Shape: [top_k, num_experts]
+        # Average selection frequency per expert across tokens.
+        # tokens_per_expert: [top_k, num_experts]
         tokens_per_expert = selected_expert_mask.mean(dim=0)
-        # Shape: [num_experts]
+        # Average router preference for each expert before top-k truncation.
+        # avg_router_prob_per_expert: [num_experts]
         avg_router_prob_per_expert = router_probs.mean(dim=0)
+
+        # Load-balancing auxiliary loss:
+        # - gets larger if routing mass and actual token assignments both collapse
+        #   onto a small subset of experts
+        # - gets smaller when tokens and router probability are spread more evenly
+        #   across experts
+        #
+        # This auxiliary term is returned to the LM, summed across MoE layers in
+        # MiniMindModel.forward(), and then added into the final training loss in
+        # LMTTSModel.forward() as `weighted_moe_aux_loss`.
         aux_loss = (
             self.num_experts
             * torch.sum(tokens_per_expert * avg_router_prob_per_expert.unsqueeze(0))

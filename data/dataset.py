@@ -158,6 +158,8 @@ class TTSDataset(Dataset):
             "prompt_latent": prompt_latent,
             "target_latent": target_latent,
             "full_text": full_text,
+            "prompt_text_raw": prompt_text,
+            "target_text_raw": target_text,
             "prompt_text_mapped": mapped_prompt,
             "target_text_mapped": mapped_target,
             "language": lang,
@@ -225,6 +227,8 @@ def collate_fn(batch: list[dict], tokenizer=None, max_text_len: int = 512) -> di
         "target_mask": target_masks,
         "padding_mask": padding_masks,
         "target_frames": target_frames,
+        "prompt_text_raw": [item["prompt_text_raw"] for item in batch],
+        "target_text_raw": [item["target_text_raw"] for item in batch],
     }
 
     # Tokenize text

@@ -669,7 +669,7 @@ def train(args: argparse.Namespace) -> None:
                     "train/stop_head_loss": float(losses.stop_head_loss.item()),
                     "train/weighted_stop_loss": float(losses.weighted_stop_loss.item()),
                     "train/weighted_moe_aux_loss": float(losses.weighted_moe_aux_loss.item()),
-                    "train/lm_moe_aux_loss": float(losses.moe_aux_loss.item()),
+                    # "train/lm_moe_aux_loss": float(losses.moe_aux_loss.item()),
                     "train/diff_loss": float(losses.diff_loss.item()),
                     "train/stop_loss": float(losses.stop_loss.item()),
                     "train/moe_aux_loss": float(losses.moe_aux_loss.item()),

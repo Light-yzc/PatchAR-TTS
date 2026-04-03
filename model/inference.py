@@ -162,11 +162,15 @@ def build_inference_examples(
             prompt_latents=prompt_latent,
             inference_cfg=inference_cfg,
         )
-        text = decode_text_tokens(
-            tokenizer,
-            batch["input_ids"][sample_idx],
-            batch["attention_mask"][sample_idx],
-        )
+        raw_texts = batch.get("target_text_raw")
+        if raw_texts is not None:
+            text = str(raw_texts[sample_idx])
+        else:
+            text = decode_text_tokens(
+                tokenizer,
+                batch["input_ids"][sample_idx],
+                batch["attention_mask"][sample_idx],
+            )
         examples.append(
             InferenceExample(
                 sample_idx=sample_idx,
@@ -186,7 +190,7 @@ def attach_decoded_waveforms(
     device: torch.device,
     precision: str = "fp16",
 ) -> list[InferenceExample]:
-    """Decode only the generated target segment into audio with the VAE."""
+    """Decode target-only prediction / ground-truth segments into audio with the VAE."""
     if not examples:
         return examples
 
@@ -194,6 +198,8 @@ def attach_decoded_waveforms(
     try:
         for example in examples:
             example.pred_waveform = vae_decode(vae, example.pred_latent)[0]
+            if example.target_latent is not None and example.target_latent.shape[1] > 0:
+                example.gt_waveform = vae_decode(vae, example.target_latent)[0]
     finally:
         del vae
         if device.type == "cuda":
