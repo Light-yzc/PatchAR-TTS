@@ -16,6 +16,11 @@ class LMTTSLosses:
     """Main training losses returned by LMTTSModel.forward()."""
 
     loss: torch.Tensor
+    lm_loss: torch.Tensor
+    dit_loss: torch.Tensor
+    stop_head_loss: torch.Tensor
+    weighted_stop_loss: torch.Tensor
+    weighted_moe_aux_loss: torch.Tensor
     diff_loss: torch.Tensor
     stop_loss: torch.Tensor
     moe_aux_loss: torch.Tensor
@@ -547,12 +552,19 @@ class LMTTSModel(nn.Module):
             chunk_mask=chunk_masks,
         )
 
-        total_loss = diff_loss
-        total_loss = total_loss + self.stop_loss_weight * stop_loss
-        total_loss = total_loss + self.moe_aux_loss_weight * moe_aux_loss
+        weighted_stop_loss = self.stop_loss_weight * stop_loss
+        weighted_moe_aux_loss = self.moe_aux_loss_weight * moe_aux_loss
+        lm_loss = weighted_stop_loss + weighted_moe_aux_loss
+
+        total_loss = diff_loss + lm_loss
 
         return LMTTSLosses(
             loss=total_loss,
+            lm_loss=lm_loss.detach(),
+            dit_loss=diff_loss.detach(),
+            stop_head_loss=stop_loss.detach(),
+            weighted_stop_loss=weighted_stop_loss.detach(),
+            weighted_moe_aux_loss=weighted_moe_aux_loss.detach(),
             diff_loss=diff_loss.detach(),
             stop_loss=stop_loss.detach(),
             moe_aux_loss=moe_aux_loss.detach() if moe_aux_loss is not None else latents.new_zeros(()),

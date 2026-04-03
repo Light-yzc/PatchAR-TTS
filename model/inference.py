@@ -164,19 +164,14 @@ def attach_decoded_waveforms(
     device: torch.device,
     precision: str = "fp16",
 ) -> list[InferenceExample]:
-    """Decode prompt+prediction and prompt+target latents into audio with the VAE."""
+    """Decode only the generated target segment into audio with the VAE."""
     if not examples:
         return examples
 
     vae = load_vae(vae_path, device=str(device), precision=precision)
     try:
         for example in examples:
-            combined_pred = torch.cat([example.prompt_latent, example.pred_latent], dim=1)
-            example.pred_waveform = vae_decode(vae, combined_pred)[0]
-
-            if example.target_latent is not None:
-                combined_gt = torch.cat([example.prompt_latent, example.target_latent], dim=1)
-                example.gt_waveform = vae_decode(vae, combined_gt)[0]
+            example.pred_waveform = vae_decode(vae, example.pred_latent)[0]
     finally:
         del vae
         if device.type == "cuda":

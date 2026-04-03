@@ -323,6 +323,8 @@ def run_periodic_inference(
     model.eval()
 
     logs: dict[str, object] = {}
+    pred_audio_count = 0
+    gt_audio_count = 0
 
     try:
         examples = build_inference_examples(
@@ -342,6 +344,8 @@ def run_periodic_inference(
                 device=device,
                 precision=inference_cfg.get("vae_precision", "fp16"),
             )
+        elif inference_cfg.get("log_audio", True):
+            print(f"[Step {global_step}] log_audio is enabled but inference.vae_path is empty; skipping audio decode.")
 
         save_outputs = bool(inference_cfg.get("save_outputs", True))
         if save_outputs:
@@ -384,17 +388,26 @@ def run_periodic_inference(
             for example in examples:
                 caption_prefix = f"step={global_step} sample={example.sample_idx}"
                 if example.pred_waveform is not None:
+                    pred_audio_count += 1
                     logs[f"infer/pred_audio_{example.sample_idx}"] = wandb.Audio(
                         waveform_to_wandb_array(example.pred_waveform),
                         sample_rate=sample_rate,
                         caption=f"{caption_prefix} pred | {example.text}",
                     )
                 if example.gt_waveform is not None:
+                    gt_audio_count += 1
                     logs[f"infer/gt_audio_{example.sample_idx}"] = wandb.Audio(
                         waveform_to_wandb_array(example.gt_waveform),
                         sample_rate=sample_rate,
                         caption=f"{caption_prefix} gt | {example.text}",
                     )
+            # logs["infer/pred_audio_count"] = pred_audio_count
+            # logs["infer/gt_audio_count"] = gt_audio_count
+            # if inference_cfg.get("log_audio", True):
+            #     print(
+            #         f"[Step {global_step}] wandb audio prepared: "
+            #         f"pred={pred_audio_count} gt={gt_audio_count}"
+            #     )
 
         if wandb_run is not None and logs:
             wandb_run.log(logs, step=global_step)
@@ -651,6 +664,12 @@ def train(args: argparse.Namespace) -> None:
                 lr = scheduler.get_last_lr()[0]
                 metrics = {
                     "train/loss": float(losses.loss.item()),
+                    "train/lm_loss": float(losses.lm_loss.item()),
+                    "train/dit_loss": float(losses.dit_loss.item()),
+                    "train/stop_head_loss": float(losses.stop_head_loss.item()),
+                    "train/weighted_stop_loss": float(losses.weighted_stop_loss.item()),
+                    "train/weighted_moe_aux_loss": float(losses.weighted_moe_aux_loss.item()),
+                    "train/lm_moe_aux_loss": float(losses.moe_aux_loss.item()),
                     "train/diff_loss": float(losses.diff_loss.item()),
                     "train/stop_loss": float(losses.stop_loss.item()),
                     "train/moe_aux_loss": float(losses.moe_aux_loss.item()),
@@ -660,8 +679,9 @@ def train(args: argparse.Namespace) -> None:
                 message = (
                     f"epoch={epoch + 1} step={global_step} "
                     f"loss={metrics['train/loss']:.4f} "
-                    f"diff={metrics['train/diff_loss']:.4f} "
-                    f"stop={metrics['train/stop_loss']:.4f} "
+                    f"lm={metrics['train/lm_loss']:.4f} "
+                    f"dit={metrics['train/dit_loss']:.4f} "
+                    f"stop={metrics['train/stop_head_loss']:.4f} "
                     f"moe_aux={metrics['train/moe_aux_loss']:.4f} "
                     f"lr={lr:.2e}"
                 )
