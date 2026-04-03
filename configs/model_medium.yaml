@@ -1,0 +1,92 @@
+model:
+  latent_dim: 64
+
+  hidden_size: 1024
+  # Sub-1B LM target: keep 8 experts, reduce depth by one layer.
+  num_layers: 15
+  num_heads: 16
+  num_kv_heads: 4
+  intermediate_size: 4096
+  dropout: 0.0
+
+  use_moe: true
+  dense_prefix_layers: 4
+  dense_tail_layers: 4
+  num_experts: 8
+  num_experts_per_tok: 2
+  moe_intermediate_size: 4096
+  router_aux_loss_coef: 5.0e-4
+
+  patch_size: 25
+  cond_tokens_per_patch: 5
+
+  dit_model_dim: 768
+  dit_num_layers: 6
+  dit_num_heads: 8
+  dit_ff_mult: 4
+  dit_dropout: 0.0
+
+  sigma_min: 1.0e-5
+  cond_dropout_prob: 0.1
+  flow_solver: euler
+
+audio:
+  latent_rate: 25
+  min_duration_sec: 3.0
+  max_duration_sec: 30.0
+  prompt_ratio_min: 0.2
+  prompt_ratio_max: 0.5
+
+data:
+  dataset_type: default
+  language: JA
+  vocab_path: data/char_vocab.json
+  max_text_len: 512
+
+training:
+  output_dir: outputs/lm_tts_medium_15l8e
+  batch_size: 4
+  num_workers: 4
+  drop_last: true
+
+  epochs: 1000000
+  max_steps: 100000
+  learning_rate: 2.0e-4
+  optimizer: adamw8bit
+  weight_decay: 1.0e-2
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  warmup_steps: 2000
+  gradient_clip: 1.0
+  fp16: true
+  gradient_checkpointing: true
+  seed: 42
+
+  stop_loss_weight: 1.0
+  moe_aux_loss_weight: 1.0
+
+  log_every_steps: 10
+  save_every_steps: 1000
+  keep_last_k: 2
+
+inference:
+  enabled: true
+  every_steps: 2000
+  num_samples: 1
+  save_outputs: true
+  max_target_patches: 50
+  min_target_patches: 1
+  num_flow_steps: 16
+  cfg_scale: 1.0
+  temperature: 1.0
+  log_audio: true
+  sample_rate: 48000
+  vae_path: null
+  vae_precision: fp16
+
+wandb:
+  enabled: true
+  project: myvox_lm_tts
+  mode: offline
+  name: null
+  tags: []
