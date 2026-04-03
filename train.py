@@ -366,18 +366,18 @@ def run_periodic_inference(
             logs[f"infer/target_frames_{sample_idx}"] = example.target_frames
             logs[f"infer/pred_frames_{sample_idx}"] = example.pred_frames
 
-        if wandb_run is not None and wandb is not None:
-            table = wandb.Table(columns=["step", "sample_idx", "text", "prompt_frames", "target_frames", "pred_frames"])
-            for example in examples:
-                table.add_data(
-                    global_step,
-                    example.sample_idx,
-                    example.text,
-                    example.prompt_frames,
-                    example.target_frames,
-                    example.pred_frames,
-                )
-            logs["infer/examples"] = table
+        # if wandb_run is not None and wandb is not None:
+        #     table = wandb.Table(columns=["step", "sample_idx", "text", "prompt_frames", "target_frames", "pred_frames"])
+        #     for example in examples:
+        #         table.add_data(
+        #             global_step,
+        #             example.sample_idx,
+        #             example.text,
+        #             example.prompt_frames,
+        #             example.target_frames,
+        #             example.pred_frames,
+        #         )
+        #     logs["infer/examples"] = table
 
         if wandb_run is not None and wandb is not None:
             sample_rate = int(inference_cfg.get("sample_rate", 48000))
@@ -599,7 +599,7 @@ def train(args: argparse.Namespace) -> None:
         )
         print(f"Resumed at step {global_step}, epoch {start_epoch}")
 
-    wandb_run = init_wandb(cfg, output_dir=output_dir, resume_id=wandb_run_id)
+    wandb_run = init_wandb(cfg, output_dir=output_dir, resume_id=None)
 
     log_every_steps = int(train_cfg.get("log_every_steps", 10))
     save_every_steps = int(train_cfg.get("save_every_steps", 1000))

@@ -1,0 +1,21 @@
+# Core training / inference
+torch
+torchaudio
+PyYAML
+tqdm
+diffusers
+
+# Text / G2P
+phonemizer
+pykakasi
+
+# Dataset preparation
+pandas
+
+# Logging / optimization
+wandb
+bitsandbytes; platform_system == "Linux"
+
+# Notes:
+# - phonemizer also needs the system package `espeak-ng`
+# - bitsandbytes is only useful on CUDA Linux and will be skipped elsewhere

@@ -39,18 +39,16 @@ audio:
 
 data:
   dataset_type: default
-  language: JA
   vocab_path: data/char_vocab.json
   max_text_len: 512
 
 training:
-  output_dir: outputs/lm_tts_medium_15l8e
   batch_size: 4
   num_workers: 4
   drop_last: true
 
   epochs: 1000000
-  max_steps: 100000
+  max_steps: 500000
   learning_rate: 2.0e-4
   optimizer: adamw8bit
   weight_decay: 1.0e-2
@@ -81,7 +79,7 @@ inference:
   temperature: 1.0
   log_audio: true
   sample_rate: 48000
-  vae_path: null
+  vae_path: /content/PatchAR-TTS/model_files/vae
   vae_precision: fp16
 
 wandb:
