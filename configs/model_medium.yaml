@@ -60,7 +60,7 @@ training:
   gradient_checkpointing: false
   seed: 42
 
-  patch_lm_loss_weight: 1.0
+  patch_lm_loss_weight: 0.1
   stop_loss_weight: 1.0
   moe_aux_loss_weight: 1.0
 

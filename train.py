@@ -465,6 +465,7 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     scaler: GradScaler,
     device: torch.device,
+    resume_optimizer_state: bool = True,
 ) -> tuple[int, int, str | None]:
     """Restore model/training state from a previously saved checkpoint."""
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
@@ -476,20 +477,23 @@ def load_checkpoint(
             f"unexpected={len(incompatible.unexpected_keys)}"
         )
 
-    try:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    except Exception as exc:
-        print(f"Warning: could not restore optimizer state: {exc}")
+    if resume_optimizer_state:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            print(f"Warning: could not restore optimizer state: {exc}")
 
-    try:
-        scheduler.load_state_dict(ckpt["scheduler"])
-    except Exception as exc:
-        print(f"Warning: could not restore scheduler state: {exc}")
+        try:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except Exception as exc:
+            print(f"Warning: could not restore scheduler state: {exc}")
 
-    try:
-        scaler.load_state_dict(ckpt["scaler"])
-    except Exception as exc:
-        print(f"Warning: could not restore scaler state: {exc}")
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception as exc:
+            print(f"Warning: could not restore scaler state: {exc}")
+    else:
+        print("Checkpoint loaded without optimizer/scheduler/scaler state.")
 
     global_step = int(ckpt.get("global_step", ckpt.get("step", 0)))
     start_epoch = int(ckpt.get("epoch", 0))
@@ -599,6 +603,7 @@ def train(args: argparse.Namespace) -> None:
             scheduler=scheduler,
             scaler=scaler,
             device=device,
+            resume_optimizer_state=not args.no_resume_optimizer,
         )
         print(f"Resumed at step {global_step}, epoch {start_epoch}")
 
@@ -737,6 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint.pt")
+    parser.add_argument(
+        "--no_resume_optimizer",
+        action="store_true",
+        help="When used with --resume, load only model weights and skip optimizer/scheduler/scaler state.",
+    )
     parser.add_argument("--vocab", type=str, default=None, help="Path to char_vocab.json")
     parser.add_argument("--device", type=str, default=None)
     return parser

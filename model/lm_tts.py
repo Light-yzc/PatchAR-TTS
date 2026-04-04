@@ -539,9 +539,11 @@ class LMTTSModel(nn.Module):
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
         pred_target_patches = self.patch_predictor(target_patch_hidden)
+        # Keep this auxiliary target fixed while still letting the same
+        # patch embeddings train the LM through teacher forcing inputs.
         patch_lm_loss_per_step = F.mse_loss(
             pred_target_patches,
-            target_patches,
+            target_patches.detach(),
             reduction="none",
         ).mean(dim=-1)
         patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
