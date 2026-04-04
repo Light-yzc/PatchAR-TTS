@@ -174,6 +174,9 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         num_experts_per_tok=model_cfg.get("num_experts_per_tok", 2),
         moe_intermediate_size=model_cfg.get("moe_intermediate_size"),
         router_aux_loss_coef=model_cfg.get("router_aux_loss_coef", 5e-4),
+        router_use_input_norm=model_cfg.get("router_use_input_norm", True),
+        router_logits_clip=model_cfg.get("router_logits_clip", 8.0),
+        router_softmax_fp32=model_cfg.get("router_softmax_fp32", True),
     )
 
     dit_config = DiTConfig(
@@ -614,6 +617,7 @@ def train(args: argparse.Namespace) -> None:
     max_steps = int(train_cfg["max_steps"])
     max_epochs = int(train_cfg.get("epochs", 1_000_000))
     gradient_clip = float(train_cfg.get("gradient_clip", 1.0))
+    moe_aux_warmup_steps = int(train_cfg.get("moe_aux_warmup_steps", 5000))
 
     model.train()
     progress_bar = tqdm(total=max_steps, initial=global_step, desc="Training")
@@ -624,6 +628,9 @@ def train(args: argparse.Namespace) -> None:
 
             batch = move_batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
+            moe_aux_scale = 1.0
+            if moe_aux_warmup_steps > 0:
+                moe_aux_scale = min((global_step + 1) / float(moe_aux_warmup_steps), 1.0)
 
             with autocast_context() if amp_enabled else nullcontext():
                 losses = model(
@@ -633,7 +640,17 @@ def train(args: argparse.Namespace) -> None:
                     prompt_mask=batch["prompt_mask"],
                     target_mask=batch["target_mask"],
                     padding_mask=batch["padding_mask"],
+                    moe_aux_scale=moe_aux_scale,
                 )
+
+            if not torch.isfinite(losses.loss):
+                print(
+                    f"[Step {global_step}] non-finite loss detected: "
+                    f"loss={float(losses.loss.detach().float().cpu())}"
+                )
+                if scaler.is_enabled():
+                    scaler.update()
+                continue
 
             # Mixed precision and full precision follow the same optimizer path;
             # the only difference is whether GradScaler is active.
@@ -669,6 +686,7 @@ def train(args: argparse.Namespace) -> None:
                     "train/diff_loss": float(losses.diff_loss.item()),
                     "train/stop_loss": float(losses.stop_loss.item()),
                     "train/moe_aux_loss": float(losses.moe_aux_loss.item()),
+                    "train/moe_aux_scale": float(moe_aux_scale),
                     "train/lr": float(lr),
                     "train/epoch": float(epoch + 1),
                 }

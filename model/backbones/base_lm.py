@@ -78,6 +78,9 @@ class MiniMindConfig(PretrainedConfig):
         moe_intermediate_size=None,
         norm_topk_prob=True,
         router_aux_loss_coef=5e-4,
+        router_use_input_norm=True,
+        router_logits_clip=8.0,
+        router_softmax_fp32=True,
         bos_token_id=1,
         eos_token_id=2,
         **kwargs,
@@ -121,6 +124,9 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size or self.intermediate_size
         self.norm_topk_prob = norm_topk_prob
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.router_use_input_norm = router_use_input_norm
+        self.router_logits_clip = router_logits_clip
+        self.router_softmax_fp32 = router_softmax_fp32
 
         self._validate()
 
@@ -368,7 +374,10 @@ class MoEFeedForward(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.router_logits_clip = config.router_logits_clip
+        self.router_softmax_fp32 = config.router_softmax_fp32
 
+        self.router_input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if config.router_use_input_norm else None
         self.router = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
@@ -383,11 +392,19 @@ class MoEFeedForward(nn.Module):
         # x:      [B, T, H]
         # flat_x: [B*T, H]
         flat_x = x.reshape(-1, hidden_dim)
+        router_input = flat_x
+        if self.router_input_norm is not None:
+            router_input = self.router_input_norm(router_input)
 
         # Router scores over experts for every token.
         # router_logits / router_probs: [num_tokens, num_experts]
-        router_logits = self.router(flat_x)
-        router_probs = F.softmax(router_logits, dim=-1)
+        router_logits = self.router(router_input)
+        if self.router_logits_clip is not None:
+            router_logits = router_logits.clamp(min=-self.router_logits_clip, max=self.router_logits_clip)
+        if self.router_softmax_fp32:
+            router_probs = F.softmax(router_logits.float(), dim=-1)
+        else:
+            router_probs = F.softmax(router_logits, dim=-1)
 
         # For each token, keep only top-k experts.
         # topk_weights / topk_experts: [num_tokens, top_k]
@@ -416,7 +433,7 @@ class MoEFeedForward(nn.Module):
             expert_input = flat_x.index_select(0, token_ids)
             expert_output = expert(expert_input)
             # expert_weight: [num_routed_tokens, 1]
-            expert_weight = topk_weights[token_ids, route_ids].unsqueeze(-1)
+            expert_weight = topk_weights[token_ids, route_ids].unsqueeze(-1).to(expert_output.dtype)
             output.index_add_(0, token_ids, expert_output * expert_weight)
 
         # Count every selected top-k route, not just the top-1 expert.
@@ -443,6 +460,7 @@ class MoEFeedForward(nn.Module):
             * torch.sum(tokens_per_expert * avg_router_prob_per_expert.unsqueeze(0))
             * self.router_aux_loss_coef
         )
+        aux_loss = aux_loss.to(flat_x.dtype)
 
         output = output.view(batch_size, seq_len, hidden_dim)
         return output, aux_loss

@@ -197,7 +197,10 @@ class LMTTSModel(nn.Module):
         self.stop_proj = nn.Linear(self.hidden_size, self.hidden_size)
         self.stop_act = nn.SiLU()
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=False)
-        self.stop_loss_fn = nn.CrossEntropyLoss(reduction="none")
+        # The stop signal is extremely rare (1 per sample vs ~29 continue labels),
+        # so we up-weight class 1 to prevent the model from always predicting "continue".
+        stop_class_weight = torch.tensor([1.0, 20.0])
+        self.stop_loss_fn = nn.CrossEntropyLoss(weight=stop_class_weight, reduction="none")
 
         self.dit = PatchDiT(dit_config)
         self.flow = ConditionalFlowMatching(self.dit, flow_config)
@@ -502,6 +505,7 @@ class LMTTSModel(nn.Module):
         prompt_mask: torch.Tensor,
         target_mask: torch.Tensor,
         padding_mask: torch.Tensor,
+        moe_aux_scale: float = 1.0,
     ) -> LMTTSLosses:
         sample_infos, prompt_patches, prompt_patch_mask, target_patches, target_patch_mask = self._prepare_audio_segments(
             latents=latents,
@@ -521,7 +525,7 @@ class LMTTSModel(nn.Module):
 
         hidden_states, _, moe_aux_loss = self.base_lm(
             inputs_embeds=inputs_embeds,
-            attention_mask=lm_attention_mask.to(dtype=torch.long),
+            attention_mask=lm_attention_mask,
         )
 
         # Standard autoregressive alignment: the predictor state for target patch j
@@ -539,11 +543,9 @@ class LMTTSModel(nn.Module):
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
         pred_target_patches = self.patch_predictor(target_patch_hidden)
-        # Keep this auxiliary target fixed while still letting the same
-        # patch embeddings train the LM through teacher forcing inputs.
         patch_lm_loss_per_step = F.mse_loss(
             pred_target_patches,
-            target_patches.detach(),
+            target_patches,
             reduction="none",
         ).mean(dim=-1)
         patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
@@ -575,7 +577,7 @@ class LMTTSModel(nn.Module):
 
         weighted_patch_lm_loss = self.patch_lm_loss_weight * patch_lm_loss
         weighted_stop_loss = self.stop_loss_weight * stop_loss
-        weighted_moe_aux_loss = self.moe_aux_loss_weight * moe_aux_loss
+        weighted_moe_aux_loss = moe_aux_scale * self.moe_aux_loss_weight * moe_aux_loss
         lm_loss = weighted_patch_lm_loss + weighted_stop_loss + weighted_moe_aux_loss
 
         total_loss = diff_loss + lm_loss
@@ -591,7 +593,7 @@ class LMTTSModel(nn.Module):
             weighted_moe_aux_loss=weighted_moe_aux_loss.detach(),
             diff_loss=diff_loss.detach(),
             stop_loss=stop_loss.detach(),
-            moe_aux_loss=moe_aux_loss.detach() if moe_aux_loss is not None else latents.new_zeros(()),
+            moe_aux_loss=moe_aux_loss.detach(),
         )
 
     @torch.no_grad()
