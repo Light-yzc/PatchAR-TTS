@@ -434,7 +434,8 @@ class MoEFeedForward(nn.Module):
             expert_output = expert(expert_input)
             # expert_weight: [num_routed_tokens, 1]
             expert_weight = topk_weights[token_ids, route_ids].unsqueeze(-1).to(expert_output.dtype)
-            output.index_add_(0, token_ids, expert_output * expert_weight)
+            weighted_expert_output = (expert_output * expert_weight).to(output.dtype)
+            output.index_add_(0, token_ids, weighted_expert_output)
 
         # Count every selected top-k route, not just the top-1 expert.
         # selected_expert_mask: [num_tokens, top_k, num_experts]
