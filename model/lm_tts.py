@@ -147,6 +147,7 @@ class LMTTSModel(nn.Module):
         patch_lm_loss_weight: float = 1.0,
         stop_loss_weight: float = 1.0,
         moe_aux_loss_weight: float = 1.0,
+        stop_class_weights: tuple[float, float] | list[float] = (1.0, 20.0),
     ) -> None:
         super().__init__()
         if latent_rate <= 0:
@@ -167,6 +168,8 @@ class LMTTSModel(nn.Module):
         self.patch_lm_loss_weight = patch_lm_loss_weight
         self.stop_loss_weight = stop_loss_weight
         self.moe_aux_loss_weight = moe_aux_loss_weight
+        if len(stop_class_weights) != 2:
+            raise ValueError("stop_class_weights must contain exactly two values: [continue_weight, stop_weight].")
 
         if dit_config.latent_dim != latent_dim:
             dit_config.latent_dim = latent_dim
@@ -199,7 +202,7 @@ class LMTTSModel(nn.Module):
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=False)
         # The stop signal is extremely rare (1 per sample vs ~29 continue labels),
         # so we up-weight class 1 to prevent the model from always predicting "continue".
-        stop_class_weight = torch.tensor([1.0, 20.0])
+        stop_class_weight = torch.tensor(stop_class_weights, dtype=torch.float32)
         self.stop_loss_fn = nn.CrossEntropyLoss(weight=stop_class_weight, reduction="none")
 
         self.dit = PatchDiT(dit_config)

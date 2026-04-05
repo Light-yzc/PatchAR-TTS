@@ -208,6 +208,7 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         patch_lm_loss_weight=train_cfg.get("patch_lm_loss_weight", 1.0),
         stop_loss_weight=train_cfg.get("stop_loss_weight", 1.0),
         moe_aux_loss_weight=train_cfg.get("moe_aux_loss_weight", 1.0),
+        stop_class_weights=train_cfg.get("stop_class_weights", [1.0, 20.0]),
     )
 
 
@@ -515,6 +516,107 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return moved
 
 
+def _scalar_debug(name: str, value: torch.Tensor | float | int) -> str:
+    """Format one scalar-ish debug value together with its finite flag."""
+    if not isinstance(value, torch.Tensor):
+        value = torch.tensor(value)
+    value = value.detach().float()
+    if value.numel() == 0:
+        return f"{name}=empty"
+    scalar = float(value.reshape(-1)[0].cpu())
+    finite = bool(torch.isfinite(value).all().item())
+    return f"{name}={scalar:.6g} finite={finite}"
+
+
+def _format_nonfinite_tensor(name: str, tensor: torch.Tensor) -> str:
+    """Summarize one tensor that already contains non-finite values."""
+    tensor = tensor.detach()
+    finite_mask = torch.isfinite(tensor)
+    finite_count = int(finite_mask.sum().item())
+    total_count = int(tensor.numel())
+    finite_abs_max = float("nan")
+    if finite_count > 0:
+        finite_values = tensor[finite_mask].float()
+        finite_abs_max = float(finite_values.abs().max().cpu())
+    return (
+        f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+        f"finite={finite_count}/{total_count}, finite_abs_max={finite_abs_max:.6g})"
+    )
+
+
+@torch.no_grad()
+def _find_nonfinite_module_tensors(module: torch.nn.Module, max_items: int = 8) -> list[str]:
+    """Return the first few model parameters / buffers that already contain NaN/Inf."""
+    issues: list[str] = []
+    for name, tensor in module.named_parameters():
+        if not torch.isfinite(tensor).all():
+            issues.append(_format_nonfinite_tensor(f"param:{name}", tensor))
+            if len(issues) >= max_items:
+                return issues
+    for name, tensor in module.named_buffers():
+        if not torch.isfinite(tensor).all():
+            issues.append(_format_nonfinite_tensor(f"buffer:{name}", tensor))
+            if len(issues) >= max_items:
+                return issues
+    return issues
+
+
+@torch.no_grad()
+def _find_nonfinite_optimizer_tensors(
+    optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    max_items: int = 8,
+) -> list[str]:
+    """Return the first few optimizer-state tensors that already contain NaN/Inf."""
+    issues: list[str] = []
+    param_names = {id(param): name for name, param in model.named_parameters()}
+    for group_idx, group in enumerate(optimizer.param_groups):
+        for param_idx, param in enumerate(group["params"]):
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            param_name = param_names.get(id(param), f"<unnamed:{group_idx}:{param_idx}>")
+            for state_name, state_value in state.items():
+                if not torch.is_tensor(state_value):
+                    continue
+                if not torch.isfinite(state_value).all():
+                    issues.append(
+                        _format_nonfinite_tensor(
+                            f"optim:{param_name}:{state_name}",
+                            state_value,
+                        )
+                    )
+                    if len(issues) >= max_items:
+                        return issues
+    return issues
+
+
+def resolve_training_precision(train_cfg: dict, device: torch.device) -> tuple[str, bool, torch.dtype | None, bool]:
+    """Resolve training precision with backward compatibility for the legacy fp16 flag."""
+    precision_value = train_cfg.get("precision")
+    if precision_value is None:
+        precision = "fp16" if bool(train_cfg.get("fp16", True)) and device.type == "cuda" else "fp32"
+    else:
+        precision = str(precision_value).lower().strip()
+
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"Unsupported training.precision={precision!r}. Expected one of fp32/fp16/bf16.")
+
+    if precision == "fp32":
+        return precision, False, None, False
+
+    if device.type != "cuda":
+        raise ValueError(f"training.precision={precision} requires CUDA, but current device is {device.type}.")
+
+    if precision == "fp16":
+        return precision, True, torch.float16, True
+
+    if not torch.cuda.is_bf16_supported():
+        raise ValueError("training.precision=bf16 was requested, but this CUDA device does not report bf16 support.")
+
+    return precision, True, torch.bfloat16, False
+
+
 def train(args: argparse.Namespace) -> None:
     """Main training entrypoint used by the CLI below."""
     cfg = load_config(args.config)
@@ -576,9 +678,14 @@ def train(args: argparse.Namespace) -> None:
     optimizer = build_optimizer(model, cfg, device=device)
     scheduler = build_scheduler(optimizer, cfg)
 
-    amp_enabled = bool(train_cfg.get("fp16", True)) and device.type == "cuda"
-    scaler = GradScaler("cuda", enabled=amp_enabled)
-    autocast_context = partial(autocast, device_type="cuda", enabled=amp_enabled)
+    precision_name, amp_enabled, autocast_dtype, scaler_enabled = resolve_training_precision(train_cfg, device)
+    scaler = GradScaler("cuda", enabled=scaler_enabled)
+    autocast_context = partial(
+        autocast,
+        device_type="cuda",
+        enabled=amp_enabled,
+        dtype=autocast_dtype,
+    )
 
     total_params, trainable_params = count_parameters(model)
     print(f"Device: {device}")
@@ -591,7 +698,7 @@ def train(args: argparse.Namespace) -> None:
     )
     print(
         f"Optimizer: {str(train_cfg.get('optimizer', 'adamw8bit')).lower()} | "
-        f"gradient_checkpointing={gradient_checkpointing}"
+        f"gradient_checkpointing={gradient_checkpointing} | precision={precision_name}"
     )
 
     global_step = 0
@@ -618,6 +725,8 @@ def train(args: argparse.Namespace) -> None:
     max_epochs = int(train_cfg.get("epochs", 1_000_000))
     gradient_clip = float(train_cfg.get("gradient_clip", 1.0))
     moe_aux_warmup_steps = int(train_cfg.get("moe_aux_warmup_steps", 5000))
+    max_consecutive_nonfinite_steps = max(1, int(train_cfg.get("max_consecutive_nonfinite_steps", 8)))
+    consecutive_nonfinite_steps = 0
 
     model.train()
     progress_bar = tqdm(total=max_steps, initial=global_step, desc="Training")
@@ -644,13 +753,67 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             if not torch.isfinite(losses.loss):
+                latent_tensor = batch["latent"].detach().float()
+                latent_abs_max = float(latent_tensor.abs().max().cpu())
+                latent_finite = bool(torch.isfinite(latent_tensor).all().item())
+                prompt_frames = batch["prompt_mask"].sum(dim=1).detach().cpu().tolist()
+                target_frames = batch["target_mask"].sum(dim=1).detach().cpu().tolist()
+                scaler_scale = scaler.get_scale() if scaler.is_enabled() else 1.0
                 print(
                     f"[Step {global_step}] non-finite loss detected: "
                     f"loss={float(losses.loss.detach().float().cpu())}"
                 )
-                if scaler.is_enabled():
-                    scaler.update()
+                print(
+                    "[Step {step}] components: {diff}, {lm}, {patch}, {stop}, {moe}, "
+                    "weighted_patch={weighted_patch}, weighted_stop={weighted_stop}, "
+                    "weighted_moe={weighted_moe}".format(
+                        step=global_step,
+                        diff=_scalar_debug("diff_loss", losses.diff_loss),
+                        lm=_scalar_debug("lm_loss", losses.lm_loss),
+                        patch=_scalar_debug("patch_lm_loss", losses.patch_lm_loss),
+                        stop=_scalar_debug("stop_loss", losses.stop_loss),
+                        moe=_scalar_debug("moe_aux_loss", losses.moe_aux_loss),
+                        weighted_patch=_scalar_debug("weighted_patch_lm_loss", losses.weighted_patch_lm_loss),
+                        weighted_stop=_scalar_debug("weighted_stop_loss", losses.weighted_stop_loss),
+                        weighted_moe=_scalar_debug("weighted_moe_aux_loss", losses.weighted_moe_aux_loss),
+                    )
+                )
+                print(
+                    f"[Step {global_step}] batch stats: "
+                    f"latent_abs_max={latent_abs_max:.6g} latent_finite={latent_finite} "
+                    f"prompt_frames={prompt_frames} target_frames={target_frames} "
+                    f"moe_aux_scale={moe_aux_scale:.6g} grad_scaler_scale={float(scaler_scale):.6g}"
+                )
+                consecutive_nonfinite_steps += 1
+                print(
+                    f"[Step {global_step}] non-finite counter="
+                    f"{consecutive_nonfinite_steps}/{max_consecutive_nonfinite_steps}"
+                )
+                bad_model_tensors = _find_nonfinite_module_tensors(model)
+                if bad_model_tensors:
+                    print(
+                        f"[Step {global_step}] model tensors already corrupted:\n  - "
+                        + "\n  - ".join(bad_model_tensors)
+                    )
+                bad_optimizer_tensors = _find_nonfinite_optimizer_tensors(optimizer, model)
+                if bad_optimizer_tensors:
+                    print(
+                        f"[Step {global_step}] optimizer tensors already corrupted:\n  - "
+                        + "\n  - ".join(bad_optimizer_tensors)
+                    )
+                if bad_model_tensors or bad_optimizer_tensors:
+                    raise RuntimeError(
+                        f"Non-finite loss at step {global_step}: model/optimizer state already contains NaN/Inf. "
+                        "Stop training and resume from an earlier checkpoint."
+                    )
+                if consecutive_nonfinite_steps >= max_consecutive_nonfinite_steps:
+                    raise RuntimeError(
+                        f"Non-finite loss persisted for {consecutive_nonfinite_steps} consecutive batches at step "
+                        f"{global_step}. Model tensors are still finite, so the instability is being recreated in "
+                        "forward/backward every batch. Stopping instead of looping forever."
+                    )
                 continue
+            consecutive_nonfinite_steps = 0
 
             # Mixed precision and full precision follow the same optimizer path;
             # the only difference is whether GradScaler is active.
