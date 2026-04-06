@@ -21,7 +21,8 @@ model:
   router_softmax_fp32: true
 
   patch_size: 25
-  cond_tokens_per_patch: 5
+  cond_tokens_per_patch: 10
+  num_ref_cond_tokens: 5
 
   dit_model_dim: 768
   dit_num_layers: 6

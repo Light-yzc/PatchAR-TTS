@@ -202,6 +202,7 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         latent_rate=audio_cfg["latent_rate"],
         patch_size=patch_size,
         cond_tokens_per_patch=cond_tokens_per_patch,
+        num_ref_cond_tokens=int(model_cfg.get("num_ref_cond_tokens", 4)),
         lm_config=lm_config,
         dit_config=dit_config,
         flow_config=flow_config,
