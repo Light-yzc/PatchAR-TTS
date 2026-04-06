@@ -25,7 +25,7 @@ model:
   num_ref_cond_tokens: 5
 
   dit_model_dim: 768
-  dit_num_layers: 6
+  dit_num_layers: 8
   dit_num_heads: 8
   dit_ff_mult: 4
   dit_dropout: 0.0
@@ -47,13 +47,13 @@ data:
   max_text_len: 512
 
 training:
-  batch_size: 12
+  batch_size: 11
   num_workers: 4
   drop_last: true
 
   epochs: 1000000
   max_steps: 500000
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-4
   optimizer: adamw8bit
   weight_decay: 1.0e-2
   adam_beta1: 0.9
@@ -64,13 +64,13 @@ training:
   gradient_checkpointing: false
   seed: 42
 
-  patch_lm_loss_weight: 1
+  patch_lm_loss_weight: 0.5
   stop_loss_weight: 1.0
   stop_class_weights: [1.0, 5.0]
   moe_aux_loss_weight: 1.0
   moe_aux_warmup_steps: 5000
 
-  log_every_steps: 10
+  log_every_steps: 20
   save_every_steps: 1000
 
 inference:
