@@ -326,6 +326,21 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: dict) -> torch.optim.
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def fast_forward_scheduler(scheduler: torch.optim.lr_scheduler.LambdaLR, step: int) -> None:
+    """Align a freshly created scheduler with an already completed global step."""
+    if step <= 0:
+        return
+    scheduler.last_epoch = step
+    scheduler._step_count = step + 1
+    closed_form_lrs = [
+        base_lr * lr_lambda(step)
+        for lr_lambda, base_lr in zip(scheduler.lr_lambdas, scheduler.base_lrs)
+    ]
+    for param_group, lr in zip(scheduler.optimizer.param_groups, closed_form_lrs):
+        param_group["lr"] = lr
+    scheduler._last_lr = list(closed_form_lrs)
+
+
 def init_wandb(cfg: dict, output_dir: Path, resume_id: str | None = None):
     """Initialize wandb only when enabled in the config and installed locally."""
     wandb_cfg = cfg.get("wandb", {})
@@ -530,7 +545,7 @@ def load_checkpoint(
     scaler: GradScaler,
     device: torch.device,
     resume_optimizer_state: bool = True,
-) -> tuple[int, int, str | None]:
+) -> tuple[int, int, str | None, bool]:
     """Restore model/training state from a previously saved checkpoint."""
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
     incompatible = model.load_state_dict(ckpt["model"], strict=False)
@@ -541,14 +556,36 @@ def load_checkpoint(
             f"unexpected={len(incompatible.unexpected_keys)}"
         )
 
+    scheduler_state_restored = False
     if resume_optimizer_state:
+        expected_group_count = len(optimizer.param_groups)
+
         try:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            optimizer_state = ckpt["optimizer"]
+            checkpoint_group_count = len(optimizer_state.get("param_groups", []))
+            if checkpoint_group_count != expected_group_count:
+                print(
+                    "Warning: skipping optimizer state restore because checkpoint has "
+                    f"{checkpoint_group_count} parameter groups but current optimizer has "
+                    f"{expected_group_count}."
+                )
+            else:
+                optimizer.load_state_dict(optimizer_state)
         except Exception as exc:
             print(f"Warning: could not restore optimizer state: {exc}")
 
         try:
-            scheduler.load_state_dict(ckpt["scheduler"])
+            scheduler_state = ckpt["scheduler"]
+            checkpoint_scheduler_groups = len(scheduler_state.get("base_lrs", []))
+            if checkpoint_scheduler_groups != expected_group_count:
+                print(
+                    "Warning: skipping scheduler state restore because checkpoint has "
+                    f"{checkpoint_scheduler_groups} base LRs but current optimizer has "
+                    f"{expected_group_count} parameter groups."
+                )
+            else:
+                scheduler.load_state_dict(scheduler_state)
+                scheduler_state_restored = True
         except Exception as exc:
             print(f"Warning: could not restore scheduler state: {exc}")
 
@@ -562,7 +599,7 @@ def load_checkpoint(
     global_step = int(ckpt.get("global_step", ckpt.get("step", 0)))
     start_epoch = int(ckpt.get("epoch", 0))
     wandb_run_id = ckpt.get("wandb_run_id")
-    return global_step, start_epoch, wandb_run_id
+    return global_step, start_epoch, wandb_run_id, scheduler_state_restored
 
 
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -766,9 +803,10 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     start_epoch = 0
     wandb_run_id = None
+    scheduler_state_restored = False
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
-        global_step, start_epoch, wandb_run_id = load_checkpoint(
+        global_step, start_epoch, wandb_run_id, scheduler_state_restored = load_checkpoint(
             resume_path=args.resume,
             model=model,
             optimizer=optimizer,
@@ -778,6 +816,9 @@ def train(args: argparse.Namespace) -> None:
             resume_optimizer_state=not args.no_resume_optimizer,
         )
         print(f"Resumed at step {global_step}, epoch {start_epoch}")
+        if global_step > 0 and (args.no_resume_optimizer or not scheduler_state_restored):
+            fast_forward_scheduler(scheduler, global_step)
+            print(f"Scheduler fast-forwarded to step {global_step} using the current optimizer groups.")
 
     wandb_run = init_wandb(cfg, output_dir=output_dir, resume_id=None)
 

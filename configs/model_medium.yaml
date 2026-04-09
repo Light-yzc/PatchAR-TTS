@@ -66,8 +66,8 @@ training:
   gradient_checkpointing: false
   seed: 42
 
-  patch_lm_loss_weight: 20.0
-  stop_loss_weight: 0.5
+  patch_lm_loss_weight: 1.0
+  stop_loss_weight: 1.0
   stop_class_weights: [1.0, 5.0]
   moe_aux_loss_weight: 1.0
   moe_aux_warmup_steps: 5000
@@ -92,7 +92,7 @@ inference:
 
 wandb:
   enabled: true
-  project: myvox_lm_tts
+  project: myvox_lm_tts_v2
   mode: online
   name: null
   tags: []

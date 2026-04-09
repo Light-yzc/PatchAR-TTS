@@ -32,6 +32,9 @@ class FlowMatchingConfig:
     sigma_min: float = 1e-5
     cond_dropout_prob: float = 0.1
     solver: str = "euler"
+    t_scheduler: str = "log-norm"
+    log_norm_mu: float = -0.4
+    log_norm_sigma: float = 1.0
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -224,6 +227,20 @@ class PatchDiT(nn.Module):
         self.output_norm = nn.LayerNorm(config.model_dim)
         self.output_proj = nn.Linear(config.model_dim, config.latent_dim)
 
+        self._init_adaln_zero()
+
+    def _init_adaln_zero(self) -> None:
+        """AdaLN-Zero: zero-initialize gate/shift/scale projections and the
+        final output projection so the network starts as the identity function.
+        This is critical for stable training (Peebles & Xie, 2023)."""
+        for block in self.blocks:
+            # ada_proj is nn.Sequential(SiLU(), Linear) — zero the Linear
+            nn.init.zeros_(block.ada_proj[-1].weight)
+            nn.init.zeros_(block.ada_proj[-1].bias)
+        # Zero-init the final output projection so initial velocity prediction is zero
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
     def enable_gradient_checkpointing(self) -> None:
         """Recompute DiT blocks on backward to lower activation memory."""
         self.gradient_checkpointing = True
@@ -396,7 +413,14 @@ class ConditionalFlowMatching(nn.Module):
             raise ValueError("target_chunk must have shape [B, T_chunk, D]")
 
         batch_size = target_chunk.shape[0]
-        timesteps = torch.rand(batch_size, device=target_chunk.device, dtype=target_chunk.dtype)
+        if self.config.t_scheduler == "log-norm":
+            # Log-normal schedule (same as VoxCPM): concentrates on informative
+            # mid-range timesteps instead of wasting capacity on extremes.
+            s = torch.randn(batch_size, device=target_chunk.device, dtype=target_chunk.dtype)
+            s = s * self.config.log_norm_sigma + self.config.log_norm_mu
+            timesteps = torch.sigmoid(s)
+        else:
+            timesteps = torch.rand(batch_size, device=target_chunk.device, dtype=target_chunk.dtype)
         noise = torch.randn_like(target_chunk)
 
         # Straight interpolation path between clean target_chunk and Gaussian noise.
