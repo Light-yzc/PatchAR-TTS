@@ -202,7 +202,6 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         latent_rate=audio_cfg["latent_rate"],
         patch_size=patch_size,
         cond_tokens_per_patch=cond_tokens_per_patch,
-        num_ref_cond_tokens=int(model_cfg.get("num_ref_cond_tokens", 4)),
         lm_config=lm_config,
         dit_config=dit_config,
         flow_config=flow_config,
@@ -213,6 +212,24 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
     )
 
 
+def _iter_trainable_params(*items) -> list[torch.nn.Parameter]:
+    params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, torch.nn.Parameter):
+            if item.requires_grad and id(item) not in seen:
+                params.append(item)
+                seen.add(id(item))
+            continue
+        for param in item.parameters():
+            if param.requires_grad and id(param) not in seen:
+                params.append(param)
+                seen.add(id(param))
+    return params
+
+
 def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch.optim.Optimizer:
     """Optimizer for the full end-to-end model.
 
@@ -221,12 +238,54 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
     """
     train_cfg = cfg["training"]
     optimizer_name = str(train_cfg.get("optimizer", "adamw8bit")).lower()
-    lr = train_cfg["learning_rate"]
+    lr = float(train_cfg["learning_rate"])
+    lm_lr = float(train_cfg.get("lm_learning_rate", lr))
+    dit_lr = float(train_cfg.get("dit_learning_rate", lr))
+    head_lr = float(train_cfg.get("head_learning_rate", lr))
     betas = (
         train_cfg.get("adam_beta1", 0.9),
         train_cfg.get("adam_beta2", 0.95),
     )
     weight_decay = train_cfg.get("weight_decay", 1e-2)
+
+    seen: set[int] = set()
+    param_groups: list[dict] = []
+
+    def add_group(name: str, group_lr: float, params: list[torch.nn.Parameter]) -> None:
+        unique_params = []
+        for param in params:
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            unique_params.append(param)
+        if unique_params:
+            param_groups.append(
+                {
+                    "name": name,
+                    "params": unique_params,
+                    "lr": group_lr,
+                    "weight_decay": weight_decay,
+                }
+            )
+
+    add_group("lm", lm_lr, _iter_trainable_params(model.base_lm))
+    add_group("dit", dit_lr, _iter_trainable_params(model.dit))
+    add_group(
+        "heads",
+        head_lr,
+        _iter_trainable_params(
+            model.patch_encoder,
+            model.cond_slot_proj,
+            model.patch_predictor,
+            model.stop_proj,
+            model.stop_head,
+            model.audio_bos,
+            model.cond_slot_embed,
+            model.cond_type_embed,
+        ),
+    )
+    remaining_params = [param for param in model.parameters() if param.requires_grad and id(param) not in seen]
+    add_group("misc", head_lr, remaining_params)
 
     if optimizer_name == "adamw8bit":
         if device.type != "cuda":
@@ -235,14 +294,14 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
             print("Warning: bitsandbytes is not installed; falling back to torch.optim.AdamW.")
         else:
             return bnb.optim.AdamW8bit(
-                model.parameters(),
+                param_groups,
                 lr=lr,
                 betas=betas,
                 weight_decay=weight_decay,
             )
 
     return torch.optim.AdamW(
-        model.parameters(),
+        param_groups,
         lr=lr,
         betas=betas,
         weight_decay=weight_decay,
@@ -701,6 +760,8 @@ def train(args: argparse.Namespace) -> None:
         f"Optimizer: {str(train_cfg.get('optimizer', 'adamw8bit')).lower()} | "
         f"gradient_checkpointing={gradient_checkpointing} | precision={precision_name}"
     )
+    optimizer_group_lrs = {group.get("name", f"group_{idx}"): group["lr"] for idx, group in enumerate(optimizer.param_groups)}
+    print("Optimizer group lrs: " + ", ".join(f"{name}={value:.2e}" for name, value in optimizer_group_lrs.items()))
 
     global_step = 0
     start_epoch = 0
@@ -836,7 +897,14 @@ def train(args: argparse.Namespace) -> None:
             progress_bar.update(1)
 
             if global_step % log_every_steps == 0:
-                lr = scheduler.get_last_lr()[0]
+                lr_values = scheduler.get_last_lr()
+                group_lrs = {
+                    optimizer.param_groups[idx].get("name", f"group_{idx}"): float(value)
+                    for idx, value in enumerate(lr_values)
+                }
+                lm_lr = group_lrs.get("lm", float(lr_values[0]))
+                dit_lr = group_lrs.get("dit", float(lr_values[0]))
+                head_lr = group_lrs.get("heads", group_lrs.get("misc", float(lr_values[0])))
                 metrics = {
                     "train/loss": float(losses.loss.item()),
                     "train/lm_loss": float(losses.lm_loss.item()),
@@ -851,7 +919,10 @@ def train(args: argparse.Namespace) -> None:
                     "train/stop_loss": float(losses.stop_loss.item()),
                     "train/moe_aux_loss": float(losses.moe_aux_loss.item()),
                     "train/moe_aux_scale": float(moe_aux_scale),
-                    "train/lr": float(lr),
+                    "train/lr": lm_lr,
+                    "train/lr_lm": lm_lr,
+                    "train/lr_dit": dit_lr,
+                    "train/lr_head": head_lr,
                     "train/epoch": float(epoch + 1),
                 }
                 message = (
@@ -862,7 +933,9 @@ def train(args: argparse.Namespace) -> None:
                     f"dit={metrics['train/dit_loss']:.4f} "
                     f"stop={metrics['train/stop_head_loss']:.4f} "
                     f"moe_aux={metrics['train/moe_aux_loss']:.4f} "
-                    f"lr={lr:.2e}"
+                    f"lm_lr={metrics['train/lr_lm']:.2e} "
+                    f"dit_lr={metrics['train/lr_dit']:.2e} "
+                    f"head_lr={metrics['train/lr_head']:.2e}"
                 )
                 progress_bar.set_postfix_str(message)
                 print(message)

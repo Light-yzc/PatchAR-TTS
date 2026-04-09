@@ -22,7 +22,6 @@ model:
 
   patch_size: 25
   cond_tokens_per_patch: 10
-  num_ref_cond_tokens: 5
 
   dit_model_dim: 768
   dit_num_layers: 8
@@ -53,7 +52,10 @@ training:
 
   epochs: 1000000
   max_steps: 500000
-  learning_rate: 2.0e-4
+  learning_rate: 1.0e-4
+  lm_learning_rate: 5.0e-5
+  dit_learning_rate: 1.0e-4
+  head_learning_rate: 1.0e-4
   optimizer: adamw8bit
   weight_decay: 1.0e-2
   adam_beta1: 0.9
@@ -64,8 +66,8 @@ training:
   gradient_checkpointing: false
   seed: 42
 
-  patch_lm_loss_weight: 0.5
-  stop_loss_weight: 1.0
+  patch_lm_loss_weight: 20.0
+  stop_loss_weight: 0.5
   stop_class_weights: [1.0, 5.0]
   moe_aux_loss_weight: 1.0
   moe_aux_warmup_steps: 5000

@@ -9,3 +9,5 @@ __pycache__/
 
 outputs/
 wandb/
+
+VoxCPM/

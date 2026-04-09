@@ -141,7 +141,6 @@ class LMTTSModel(nn.Module):
         latent_rate: int,
         patch_size: int,
         cond_tokens_per_patch: int,
-        num_ref_cond_tokens: int,
         lm_config: MiniMindConfig,
         dit_config: DiTConfig,
         flow_config: FlowMatchingConfig | None = None,
@@ -157,8 +156,6 @@ class LMTTSModel(nn.Module):
             raise ValueError("patch_size must be positive")
         if cond_tokens_per_patch <= 0:
             raise ValueError("cond_tokens_per_patch must be positive")
-        if num_ref_cond_tokens <= 0:
-            raise ValueError("num_ref_cond_tokens must be positive")
 
         if lm_config.vocab_size != vocab_size:
             lm_config.vocab_size = vocab_size
@@ -167,7 +164,6 @@ class LMTTSModel(nn.Module):
         self.latent_rate = latent_rate
         self.patch_size = patch_size
         self.cond_tokens_per_patch = cond_tokens_per_patch
-        self.num_ref_cond_tokens = num_ref_cond_tokens
         self.max_chunk_size = patch_size
         self.patch_lm_loss_weight = patch_lm_loss_weight
         self.stop_loss_weight = stop_loss_weight
@@ -195,15 +191,6 @@ class LMTTSModel(nn.Module):
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
         self.cond_slot_embed = nn.Parameter(torch.randn(1, cond_tokens_per_patch, self.hidden_size) * 0.02)
         self.cond_type_embed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
-        # Prompt audio is compressed into a fixed set of reference tokens for
-        # DiT cross-attention, instead of being treated as target-side history.
-        self.ref_token_proj = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.SiLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        )
-        self.ref_slot_embed = nn.Parameter(torch.randn(1, num_ref_cond_tokens, self.hidden_size) * 0.02)
-        self.ref_type_embed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
         # Explicit LM auxiliary head: predict the next target patch embedding under
         # teacher forcing, instead of relying only on stop / DiT gradients.
         self.patch_predictor = nn.Sequential(
@@ -275,66 +262,6 @@ class LMTTSModel(nn.Module):
         cond_tokens = cond_tokens.view(batch_size, num_steps, self.cond_tokens_per_patch, self.hidden_size)
         cond_tokens = cond_tokens + self.cond_slot_embed.unsqueeze(1) + self.cond_type_embed.unsqueeze(1)
         return cond_tokens
-
-    def _prompt_to_ref_cond_tokens(
-        self,
-        prompt_patch_embeds: torch.Tensor,
-        prompt_patch_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compress variable-length prompt patch embeddings into a fixed number of
-        DiT reference tokens with simple segment pooling.
-        """
-        if prompt_patch_embeds.dim() != 3:
-            raise ValueError("prompt_patch_embeds must have shape [B, N_prompt, H]")
-        if prompt_patch_mask.shape != prompt_patch_embeds.shape[:2]:
-            raise ValueError(f"prompt_patch_mask must have shape {prompt_patch_embeds.shape[:2]}")
-
-        batch_size = prompt_patch_embeds.shape[0]
-        ref_tokens = prompt_patch_embeds.new_zeros(batch_size, self.num_ref_cond_tokens, self.hidden_size)
-        ref_mask = torch.zeros(batch_size, self.num_ref_cond_tokens, device=prompt_patch_embeds.device, dtype=torch.bool)
-
-        for batch_idx in range(batch_size):
-            valid_steps = int(prompt_patch_mask[batch_idx].sum().item())
-            if valid_steps <= 0:
-                continue
-
-            valid_prompt = prompt_patch_embeds[batch_idx, :valid_steps]
-            if valid_steps <= self.num_ref_cond_tokens:
-                ref_tokens[batch_idx, :valid_steps] = valid_prompt
-                ref_mask[batch_idx, :valid_steps] = True
-                continue
-
-            for ref_idx in range(self.num_ref_cond_tokens):
-                start = (ref_idx * valid_steps) // self.num_ref_cond_tokens
-                end = ((ref_idx + 1) * valid_steps) // self.num_ref_cond_tokens
-                ref_tokens[batch_idx, ref_idx] = valid_prompt[start:end].mean(dim=0)
-                ref_mask[batch_idx, ref_idx] = True
-
-        ref_tokens = self.ref_token_proj(ref_tokens)
-        ref_tokens = ref_tokens + self.ref_slot_embed + self.ref_type_embed
-        ref_tokens = ref_tokens * ref_mask.unsqueeze(-1).to(ref_tokens.dtype)
-        return ref_tokens
-
-    def _combine_dit_cond_tokens(
-        self,
-        ref_cond_tokens: torch.Tensor,
-        patch_cond_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Concatenate per-sample reference tokens with per-patch LM condition slots.
-        """
-        if ref_cond_tokens.dim() != 3:
-            raise ValueError("ref_cond_tokens must have shape [B, N_ref, H]")
-        if patch_cond_tokens.dim() != 4:
-            raise ValueError("patch_cond_tokens must have shape [B, N_patch, N_lm, H]")
-        if ref_cond_tokens.shape[0] != patch_cond_tokens.shape[0]:
-            raise ValueError("ref_cond_tokens batch size must match patch_cond_tokens batch size")
-        if ref_cond_tokens.shape[-1] != patch_cond_tokens.shape[-1]:
-            raise ValueError("ref_cond_tokens hidden size must match patch_cond_tokens hidden size")
-
-        expanded_ref = ref_cond_tokens.unsqueeze(1).expand(-1, patch_cond_tokens.shape[1], -1, -1)
-        return torch.cat([expanded_ref, patch_cond_tokens], dim=2)
 
     def _pad_embedding_list(self, tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Pad a batch of variable-length [T, H] embedding sequences."""
@@ -410,6 +337,7 @@ class LMTTSModel(nn.Module):
             target_patch_list.append(target_patch_embeds)
             sample_infos.append(
                 {
+                    "prompt_frames": prompt_frames,
                     "target_frames": target_frames,
                     "prompt_patch_steps": prompt_patch_embeds.shape[0],
                     "target_patch_steps": target_patch_embeds.shape[0],
@@ -542,9 +470,12 @@ class LMTTSModel(nn.Module):
 
                 # Use the immediately preceding fine frames as the local acoustic
                 # history that helps the current patch connect smoothly.
-                # Prompt audio is not treated as target-side history here.
-                history_start = max(0, patch_start - self.patch_size)
-                history = target_frames[history_start:patch_start]
+                if patch_idx == 0:
+                    prompt_frames = sample["prompt_frames"]
+                    history = prompt_frames[-self.patch_size :]
+                else:
+                    history_start = max(0, patch_start - self.patch_size)
+                    history = target_frames[history_start:patch_start]
                 history_valid_len = history.shape[0]
 
                 padded_history = target_frames.new_zeros(self.patch_size, self.latent_dim)
@@ -608,10 +539,6 @@ class LMTTSModel(nn.Module):
             target_positions=target_positions,
             target_mask=target_patch_mask,
         )
-        ref_cond_tokens = self._prompt_to_ref_cond_tokens(
-            prompt_patch_embeds=prompt_patches,
-            prompt_patch_mask=prompt_patch_mask,
-        )
 
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
@@ -634,10 +561,7 @@ class LMTTSModel(nn.Module):
         # The same LM predictor state serves two roles:
         # 1) stop prediction
         # 2) condition slots for the DiT patch decoder
-        target_patch_cond_tokens = self._combine_dit_cond_tokens(
-            ref_cond_tokens=ref_cond_tokens,
-            patch_cond_tokens=self._hidden_to_cond_tokens(target_patch_hidden),
-        )
+        target_patch_cond_tokens = self._hidden_to_cond_tokens(target_patch_hidden)
         fine_chunks, cond_token_chunks, history_chunks, history_masks, chunk_masks = self._build_chunk_batch(
             sample_infos=sample_infos,
             target_patch_cond_tokens=target_patch_cond_tokens,
@@ -704,7 +628,6 @@ class LMTTSModel(nn.Module):
             )
         else:
             prompt_patch_embeds = self.audio_bos.new_zeros(1, 0, self.hidden_size)
-        prompt_patch_step_mask = prompt_patch_mask.any(dim=-1).unsqueeze(0)
 
         text_len = int(attention_mask[0].sum().item())
         text_embed = self.base_lm.embed_tokens(input_ids[0, :text_len]).unsqueeze(0)
@@ -723,25 +646,21 @@ class LMTTSModel(nn.Module):
 
         generated_patches = []
         generated_fine = prompt_frames.new_zeros(0, self.latent_dim)
-        ref_cond_tokens = self._prompt_to_ref_cond_tokens(
-            prompt_patch_embeds=prompt_patch_embeds,
-            prompt_patch_mask=prompt_patch_step_mask,
-        )
 
         for patch_idx in range(max_target_patches):
             predictor_hidden = lm_hidden
             stop_flag = self.stop_head(self.stop_act(self.stop_proj(predictor_hidden))).argmax(dim=-1).item() == 1
             should_stop = stop_flag and (patch_idx + 1) >= min_target_patches
 
-            cond_tokens = self._combine_dit_cond_tokens(
-                ref_cond_tokens=ref_cond_tokens,
-                patch_cond_tokens=self._hidden_to_cond_tokens(predictor_hidden),
-            ).squeeze(1)
+            cond_tokens = self._hidden_to_cond_tokens(predictor_hidden).squeeze(1)
             # In v1 inference we decode a full patch each step, so every frame in
             # the current patch is valid.
             chunk_mask = torch.ones(1, self.patch_size, device=prefix_embeds.device, dtype=torch.bool)
 
-            history = generated_fine[-self.patch_size :]
+            if patch_idx == 0:
+                history = prompt_frames[-self.patch_size :]
+            else:
+                history = generated_fine[-self.patch_size :]
             history_padded = prompt_frames.new_zeros(1, self.patch_size, self.latent_dim)
             history_mask = torch.zeros(1, self.patch_size, device=prefix_embeds.device, dtype=torch.bool)
             if history.shape[0] > 0:
