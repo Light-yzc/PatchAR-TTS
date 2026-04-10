@@ -545,10 +545,17 @@ def load_checkpoint(
     scaler: GradScaler,
     device: torch.device,
     resume_optimizer_state: bool = True,
+    reinit_dit: bool = False,
 ) -> tuple[int, int, str | None, bool]:
     """Restore model/training state from a previously saved checkpoint."""
     ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-    incompatible = model.load_state_dict(ckpt["model"], strict=False)
+    state_dict = ckpt["model"]
+    if reinit_dit:
+        dit_keys = [k for k in state_dict if k.startswith("dit.") or k.startswith("flow.")]
+        for k in dit_keys:
+            del state_dict[k]
+        print(f"--reinit_dit: removed {len(dit_keys)} DiT keys, will use fresh AdaLN-Zero init")
+    incompatible = model.load_state_dict(state_dict, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         print(
             "Loaded checkpoint with compatibility mode: "
@@ -813,7 +820,8 @@ def train(args: argparse.Namespace) -> None:
             scheduler=scheduler,
             scaler=scaler,
             device=device,
-            resume_optimizer_state=not args.no_resume_optimizer,
+            resume_optimizer_state=not (args.no_resume_optimizer or args.reinit_dit),
+            reinit_dit=args.reinit_dit,
         )
         print(f"Resumed at step {global_step}, epoch {start_epoch}")
         if global_step > 0 and (args.no_resume_optimizer or not scheduler_state_restored):
@@ -1043,6 +1051,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="When used with --resume, load only model weights and skip optimizer/scheduler/scaler state.",
     )
+    parser.add_argument("--reinit_dit", action="store_true",
+                        help="Reinitialize DiT weights (with AdaLN-Zero) while keeping trained LM weights.")
     parser.add_argument("--vocab", type=str, default=None, help="Path to char_vocab.json")
     parser.add_argument("--device", type=str, default=None)
     return parser
