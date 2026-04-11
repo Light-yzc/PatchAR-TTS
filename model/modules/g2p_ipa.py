@@ -2,6 +2,7 @@ import os
 
 
 import sys
+import logging
 # 直接指向系统 espeak-ng 库
 if sys.platform == "darwin":
     os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = "/opt/homebrew/lib/libespeak-ng.1.dylib"
@@ -32,6 +33,11 @@ try:
     HAS_PHONEMIZER = True
 except ImportError:
     HAS_PHONEMIZER = False
+
+
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
+logging.getLogger("phonemizer.phonemize").setLevel(logging.ERROR)
+logging.getLogger("phonemizer.backend").setLevel(logging.ERROR)
 
 try:
     import pykakasi

@@ -49,7 +49,7 @@ data:
 
 training:
   # Smaller patches increase LM/DiT sequence length a lot, so keep memory in check.
-  batch_size: 4
+  batch_size: 48
   num_workers: 4
   drop_last: true
 
