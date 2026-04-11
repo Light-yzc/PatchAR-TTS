@@ -96,5 +96,7 @@
   "[EROGE]": 94,
   "¡": 95,
   "¿": 96,
-  "«": 97
+  "«": 97,
+  "[PROMPT_AUDIO_START]": 98,
+  "[TARGET_AUDIO_START]": 99
 }

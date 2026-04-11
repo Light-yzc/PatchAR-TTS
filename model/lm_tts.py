@@ -141,6 +141,7 @@ class LMTTSModel(nn.Module):
         latent_rate: int,
         patch_size: int,
         cond_tokens_per_patch: int,
+        audio_special_token_ids: dict[str, int],
         lm_config: MiniMindConfig,
         dit_config: DiTConfig,
         flow_config: FlowMatchingConfig | None = None,
@@ -168,6 +169,14 @@ class LMTTSModel(nn.Module):
         self.patch_lm_loss_weight = patch_lm_loss_weight
         self.stop_loss_weight = stop_loss_weight
         self.moe_aux_loss_weight = moe_aux_loss_weight
+        try:
+            self.prompt_audio_start_token_id = int(audio_special_token_ids["prompt_audio_start"])
+            self.target_audio_start_token_id = int(audio_special_token_ids["target_audio_start"])
+        except KeyError as exc:
+            raise ValueError("audio_special_token_ids must contain prompt_audio_start and target_audio_start") from exc
+        for token_id in (self.prompt_audio_start_token_id, self.target_audio_start_token_id):
+            if token_id < 0 or token_id >= vocab_size:
+                raise ValueError(f"audio special token id {token_id} is outside vocab_size={vocab_size}")
         if len(stop_class_weights) != 2:
             raise ValueError("stop_class_weights must contain exactly two values: [continue_weight, stop_weight].")
 
@@ -184,8 +193,6 @@ class LMTTSModel(nn.Module):
             hidden_size=self.hidden_size,
         )
 
-        # AUDIO_BOS marks the handoff from text steps to audio patch steps.
-        self.audio_bos = nn.Parameter(torch.randn(1, self.hidden_size) * 0.02)
         # One LM patch hidden expands into a small set of slot tokens that act
         # as DiT cross-attention memory for the current patch.
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
@@ -256,12 +263,18 @@ class LMTTSModel(nn.Module):
         cond_tokens = cond_tokens + self.cond_slot_embed.unsqueeze(1) + self.cond_type_embed.unsqueeze(1)
         return cond_tokens
 
+    def _hidden_zeros(self, *shape: int) -> torch.Tensor:
+        return self.base_lm.embed_tokens.weight.new_zeros(*shape)
+
+    def _special_audio_embed(self, token_id: int) -> torch.Tensor:
+        return self.base_lm.embed_tokens.weight[token_id : token_id + 1]
+
     def _pad_embedding_list(self, tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Pad a batch of variable-length [T, H] embedding sequences."""
         max_len = max((tensor.shape[0] for tensor in tensors), default=0)
         batch_size = len(tensors)
-        padded = self.audio_bos.new_zeros(batch_size, max_len, self.hidden_size)
-        mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.audio_bos.device)
+        padded = self._hidden_zeros(batch_size, max_len, self.hidden_size)
+        mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=padded.device)
 
         for batch_idx, tensor in enumerate(tensors):
             seq_len = tensor.shape[0]
@@ -319,7 +332,7 @@ class LMTTSModel(nn.Module):
                     prompt_patch_mask.unsqueeze(0),
                 ).squeeze(0)
             else:
-                prompt_patch_embeds = self.audio_bos.new_zeros(0, self.hidden_size)
+                prompt_patch_embeds = self._hidden_zeros(0, self.hidden_size)
 
             target_patch_embeds = self.patch_encoder(
                 target_patches.unsqueeze(0),
@@ -349,10 +362,11 @@ class LMTTSModel(nn.Module):
         prompt_patch_mask: torch.Tensor,
         target_patches: torch.Tensor,
         target_patch_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Build the mixed LM sequence:
-            [text tokens] + [AUDIO_BOS] + [prompt patch embeds] + [target patch embeds]
+            with prompt: [text tokens] + [PROMPT_AUDIO_START] + [prompt patch embeds] + [TARGET_AUDIO_START] + [target patch embeds]
+            no prompt:   [text tokens] + [TARGET_AUDIO_START] + [target patch embeds]
 
         target_positions stores where the target patch steps live inside that mixed
         sequence so we can gather the right predictor states later.
@@ -368,27 +382,31 @@ class LMTTSModel(nn.Module):
         for batch_idx in range(batch_size):
             text_len = int(attention_mask[batch_idx].sum().item())
             text_embed = self.base_lm.embed_tokens(input_ids[batch_idx, :text_len])
-            bos = self.audio_bos
 
             prompt_steps = int(prompt_patch_mask[batch_idx].sum().item())
             target_steps = int(target_patch_mask[batch_idx].sum().item())
             prompt_embed = prompt_patches[batch_idx, :prompt_steps]
             target_embed = target_patches[batch_idx, :target_steps]
 
-            sequence = torch.cat([text_embed, bos, prompt_embed, target_embed], dim=0)
+            target_start = self._special_audio_embed(self.target_audio_start_token_id)
+            if prompt_steps > 0:
+                prompt_start = self._special_audio_embed(self.prompt_audio_start_token_id)
+                sequence = torch.cat([text_embed, prompt_start, prompt_embed, target_start, target_embed], dim=0)
+                start = text_len + 2 + prompt_steps
+            else:
+                sequence = torch.cat([text_embed, target_start, target_embed], dim=0)
+                start = text_len + 1
             sequence_mask = torch.ones(sequence.shape[0], device=input_ids.device, dtype=torch.bool)
             sequences.append(sequence)
             seq_masks.append(sequence_mask)
 
             seq_target_positions = torch.zeros(max_target_steps, device=input_ids.device, dtype=torch.long)
             if target_steps > 0:
-                # First target patch step comes strictly after text + BOS + prompt patches.
-                start = text_len + 1 + prompt_steps
                 seq_target_positions[:target_steps] = torch.arange(target_steps, device=input_ids.device) + start
             target_positions.append(seq_target_positions)
 
         max_seq_len = max(sequence.shape[0] for sequence in sequences)
-        inputs_embeds = self.audio_bos.new_zeros(batch_size, max_seq_len, self.hidden_size)
+        inputs_embeds = self._hidden_zeros(batch_size, max_seq_len, self.hidden_size)
         lm_attention_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=input_ids.device)
         padded_target_positions = torch.stack(target_positions, dim=0)
 
@@ -615,12 +633,16 @@ class LMTTSModel(nn.Module):
                 prompt_patch_mask.unsqueeze(0),
             )
         else:
-            prompt_patch_embeds = self.audio_bos.new_zeros(1, 0, self.hidden_size)
+            prompt_patch_embeds = self._hidden_zeros(1, 0, self.hidden_size)
 
         text_len = int(attention_mask[0].sum().item())
         text_embed = self.base_lm.embed_tokens(input_ids[0, :text_len]).unsqueeze(0)
-        bos = self.audio_bos.unsqueeze(0)
-        prefix_embeds = torch.cat([text_embed, bos, prompt_patch_embeds], dim=1)
+        target_start = self._special_audio_embed(self.target_audio_start_token_id).unsqueeze(0)
+        if prompt_patch_embeds.shape[1] > 0:
+            prompt_start = self._special_audio_embed(self.prompt_audio_start_token_id).unsqueeze(0)
+            prefix_embeds = torch.cat([text_embed, prompt_start, prompt_patch_embeds, target_start], dim=1)
+        else:
+            prefix_embeds = torch.cat([text_embed, target_start], dim=1)
         prefix_mask = torch.ones(prefix_embeds.shape[:2], device=prefix_embeds.device, dtype=torch.long)
 
         hidden_states, past_key_values, _ = self.base_lm(
@@ -628,8 +650,8 @@ class LMTTSModel(nn.Module):
             attention_mask=prefix_mask,
             use_cache=True,
         )
-        # The last hidden after text + BOS + prompt is the predictor state for
-        # the first generated patch.
+        # The last hidden after the audio boundary prefix is the predictor state
+        # for the first generated patch.
         lm_hidden = hidden_states[:, -1, :]
 
         generated_patches = []

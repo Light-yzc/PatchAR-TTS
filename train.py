@@ -42,6 +42,9 @@ except ImportError:
 warnings.filterwarnings("ignore", module="phonemizer")
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 
+PROMPT_AUDIO_START_TOKEN = "[PROMPT_AUDIO_START]"
+TARGET_AUDIO_START_TOKEN = "[TARGET_AUDIO_START]"
+
 
 def load_config(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -133,7 +136,28 @@ def build_tokenizer(
     return tokenizer, output_vocab_path
 
 
-def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
+def resolve_audio_special_token_ids(tokenizer: CharTokenizer) -> dict[str, int]:
+    missing_tokens = [
+        token
+        for token in (PROMPT_AUDIO_START_TOKEN, TARGET_AUDIO_START_TOKEN)
+        if token not in tokenizer.vocab
+    ]
+    if missing_tokens:
+        raise ValueError(
+            "Tokenizer vocab is missing required audio boundary tokens: " + ", ".join(missing_tokens)
+        )
+    return {
+        "prompt_audio_start": tokenizer.vocab[PROMPT_AUDIO_START_TOKEN],
+        "target_audio_start": tokenizer.vocab[TARGET_AUDIO_START_TOKEN],
+    }
+
+
+def build_model(
+    cfg: dict,
+    latent_dim: int,
+    vocab_size: int,
+    audio_special_token_ids: dict[str, int],
+) -> LMTTSModel:
     """
     Build the patch-level LM-TTS model from YAML config.
 
@@ -202,6 +226,7 @@ def build_model(cfg: dict, latent_dim: int, vocab_size: int) -> LMTTSModel:
         latent_rate=audio_cfg["latent_rate"],
         patch_size=patch_size,
         cond_tokens_per_patch=cond_tokens_per_patch,
+        audio_special_token_ids=audio_special_token_ids,
         lm_config=lm_config,
         dit_config=dit_config,
         flow_config=flow_config,
@@ -276,10 +301,8 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
         _iter_trainable_params(
             model.patch_encoder,
             model.cond_slot_proj,
-            model.patch_predictor,
             model.stop_proj,
             model.stop_head,
-            model.audio_bos,
             model.cond_slot_embed,
             model.cond_type_embed,
         ),
@@ -775,7 +798,13 @@ def train(args: argparse.Namespace) -> None:
 
     example = dataset[0]
     latent_dim = int(example["target_latent"].shape[-1])
-    model = build_model(cfg, latent_dim=latent_dim, vocab_size=tokenizer.vocab_size).to(device)
+    audio_special_token_ids = resolve_audio_special_token_ids(tokenizer)
+    model = build_model(
+        cfg,
+        latent_dim=latent_dim,
+        vocab_size=tokenizer.vocab_size,
+        audio_special_token_ids=audio_special_token_ids,
+    ).to(device)
     gradient_checkpointing = bool(train_cfg.get("gradient_checkpointing", False))
     if gradient_checkpointing:
         model.enable_gradient_checkpointing()
@@ -795,6 +824,11 @@ def train(args: argparse.Namespace) -> None:
     print(f"Device: {device}")
     print(f"Dataset: {len(dataset)} samples")
     print(f"Tokenizer vocab: {tokenizer.vocab_size}")
+    print(
+        "Audio token ids: "
+        f"{PROMPT_AUDIO_START_TOKEN}={audio_special_token_ids['prompt_audio_start']}, "
+        f"{TARGET_AUDIO_START_TOKEN}={audio_special_token_ids['target_audio_start']}"
+    )
     print(f"Model parameters: {total_params / 1e6:.2f}M (trainable: {trainable_params / 1e6:.2f}M)")
     print(
         f"Training: batch_size={train_cfg['batch_size']}, max_steps={train_cfg['max_steps']}, "
