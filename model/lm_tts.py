@@ -191,13 +191,6 @@ class LMTTSModel(nn.Module):
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
         self.cond_slot_embed = nn.Parameter(torch.randn(1, cond_tokens_per_patch, self.hidden_size) * 0.02)
         self.cond_type_embed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
-        # Explicit LM auxiliary head: predict the next target patch embedding under
-        # teacher forcing, instead of relying only on stop / DiT gradients.
-        self.patch_predictor = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.SiLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-        )
         self.stop_proj = nn.Linear(self.hidden_size, self.hidden_size)
         self.stop_act = nn.SiLU()
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -542,13 +535,8 @@ class LMTTSModel(nn.Module):
 
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
-        pred_target_patches = self.patch_predictor(target_patch_hidden)
-        patch_lm_loss_per_step = F.mse_loss(
-            pred_target_patches,
-            target_patches,
-            reduction="none",
-        ).mean(dim=-1)
-        patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
+        # patch_lm_loss removed — DiT gradients drive LM learning directly
+        patch_lm_loss = torch.tensor(0.0, device=hidden_states.device)
 
         stop_logits = self.stop_head(self.stop_act(self.stop_proj(target_patch_hidden)))
         stop_labels = self._build_stop_labels(target_patch_mask)

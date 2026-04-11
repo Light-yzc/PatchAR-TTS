@@ -20,8 +20,10 @@ model:
   router_logits_clip: 8.0
   router_softmax_fp32: true
 
-  patch_size: 25
-  cond_tokens_per_patch: 10
+  # Use a much finer audio step so one LM state does not need to summarize ~1s.
+  # With latent_rate=25, patch_size=4 means ~160 ms per autoregressive step.
+  patch_size: 4
+  cond_tokens_per_patch: 4
 
   dit_model_dim: 768
   dit_num_layers: 8
@@ -46,7 +48,8 @@ data:
   max_text_len: 512
 
 training:
-  batch_size: 11
+  # Smaller patches increase LM/DiT sequence length a lot, so keep memory in check.
+  batch_size: 4
   num_workers: 4
   drop_last: true
 
@@ -63,10 +66,10 @@ training:
   warmup_steps: 2000
   gradient_clip: 1.0
   precision: bf16
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   seed: 42
 
-  patch_lm_loss_weight: 0.1
+  patch_lm_loss_weight: 0.0
   stop_loss_weight: 1.0
   stop_class_weights: [1.0, 5.0]
   moe_aux_loss_weight: 1.0
@@ -80,7 +83,8 @@ inference:
   every_steps: 2000
   num_samples: 1
   save_outputs: true
-  max_target_patches: 50
+  # 50 patches only covered ~8s with patch_size=4, which truncates normal utterances.
+  max_target_patches: 320
   min_target_patches: 1
   num_flow_steps: 16
   cfg_scale: 1.0
@@ -92,7 +96,7 @@ inference:
 
 wandb:
   enabled: true
-  project: myvox_lm_tts_v2
+  project: myvox_lm_tts_v2_long_lm
   mode: online
   name: null
   tags: []
