@@ -301,6 +301,8 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
         _iter_trainable_params(
             model.patch_encoder,
             model.cond_slot_proj,
+            model.speaker_attn_score,
+            model.speaker_proj,
             model.stop_proj,
             model.stop_head,
             model.cond_slot_embed,

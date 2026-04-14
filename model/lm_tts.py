@@ -198,6 +198,12 @@ class LMTTSModel(nn.Module):
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
         self.cond_slot_embed = nn.Parameter(torch.randn(1, cond_tokens_per_patch, self.hidden_size) * 0.02)
         self.cond_type_embed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+        self.speaker_attn_score = nn.Linear(self.hidden_size, 1)
+        self.speaker_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, dit_config.model_dim),
+        )
         self.stop_proj = nn.Linear(self.hidden_size, self.hidden_size)
         self.stop_act = nn.SiLU()
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=False)
@@ -268,6 +274,24 @@ class LMTTSModel(nn.Module):
 
     def _special_audio_embed(self, token_id: int) -> torch.Tensor:
         return self.base_lm.embed_tokens.weight[token_id : token_id + 1]
+
+    def _pool_speaker_summary(
+        self,
+        prompt_patch_embeds: torch.Tensor,
+        prompt_patch_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool valid prompt patch embeddings into one global speaker summary."""
+        batch_size = prompt_patch_embeds.shape[0]
+        if prompt_patch_embeds.shape[1] == 0:
+            return self._hidden_zeros(batch_size, self.hidden_size)
+
+        prompt_patch_mask = prompt_patch_mask.to(device=prompt_patch_embeds.device, dtype=torch.bool)
+        scores = self.speaker_attn_score(prompt_patch_embeds).squeeze(-1)
+        masked_scores = scores.masked_fill(~prompt_patch_mask, -1e4)
+        attn = torch.softmax(masked_scores, dim=-1)
+        attn = attn * prompt_patch_mask.to(attn.dtype)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return (attn.unsqueeze(-1) * prompt_patch_embeds).sum(dim=1)
 
     def _pad_embedding_list(self, tensors: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Pad a batch of variable-length [T, H] embedding sequences."""
@@ -446,8 +470,9 @@ class LMTTSModel(nn.Module):
         self,
         sample_infos: list[dict],
         target_patch_cond_tokens: torch.Tensor,
+        speaker_cond: torch.Tensor,
         target_patch_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Flatten all target patches across the batch into one DiT training batch.
 
@@ -458,6 +483,7 @@ class LMTTSModel(nn.Module):
         """
         target_patches = []
         cond_token_chunks = []
+        speaker_chunks = []
         history_chunks = []
         history_masks = []
         patch_masks = []
@@ -482,8 +508,7 @@ class LMTTSModel(nn.Module):
                 # Use the immediately preceding fine frames as the local acoustic
                 # history that helps the current patch connect smoothly.
                 if patch_idx == 0:
-                    prompt_frames = sample["prompt_frames"]
-                    history = prompt_frames[-self.patch_size :]
+                    history = target_frames[:0]
                 else:
                     history_start = max(0, patch_start - self.patch_size)
                     history = target_frames[history_start:patch_start]
@@ -496,6 +521,7 @@ class LMTTSModel(nn.Module):
 
                 target_patches.append(padded_patch)
                 cond_token_chunks.append(cond_tokens)
+                speaker_chunks.append(speaker_cond[batch_idx])
                 history_chunks.append(padded_history)
                 history_masks.append(history_mask)
                 patch_masks.append(patch_mask)
@@ -503,6 +529,7 @@ class LMTTSModel(nn.Module):
         return (
             torch.stack(target_patches, dim=0),
             torch.stack(cond_token_chunks, dim=0),
+            torch.stack(speaker_chunks, dim=0),
             torch.stack(history_chunks, dim=0),
             torch.stack(history_masks, dim=0),
             torch.stack(patch_masks, dim=0),
@@ -568,14 +595,18 @@ class LMTTSModel(nn.Module):
         # 1) stop prediction
         # 2) condition slots for the DiT patch decoder
         target_patch_cond_tokens = self._hidden_to_cond_tokens(target_patch_hidden)
-        fine_chunks, cond_token_chunks, history_chunks, history_masks, chunk_masks = self._build_chunk_batch(
+        speaker_summary = self._pool_speaker_summary(prompt_patches, prompt_patch_mask)
+        speaker_cond = self.speaker_proj(speaker_summary)
+        fine_chunks, cond_token_chunks, speaker_chunks, history_chunks, history_masks, chunk_masks = self._build_chunk_batch(
             sample_infos=sample_infos,
             target_patch_cond_tokens=target_patch_cond_tokens,
+            speaker_cond=speaker_cond,
             target_patch_mask=target_patch_mask,
         )
         diff_loss = self.flow.compute_loss(
             target_chunk=fine_chunks,
             cond_tokens=cond_token_chunks,
+            speaker_cond=speaker_chunks,
             history_fine_latents=history_chunks,
             history_mask=history_masks,
             chunk_mask=chunk_masks,
@@ -634,6 +665,9 @@ class LMTTSModel(nn.Module):
             )
         else:
             prompt_patch_embeds = self._hidden_zeros(1, 0, self.hidden_size)
+        prompt_patch_valid_mask = prompt_patch_mask.any(dim=-1, keepdim=False).unsqueeze(0)
+        speaker_summary = self._pool_speaker_summary(prompt_patch_embeds, prompt_patch_valid_mask)
+        speaker_cond = self.speaker_proj(speaker_summary)
 
         text_len = int(attention_mask[0].sum().item())
         text_embed = self.base_lm.embed_tokens(input_ids[0, :text_len]).unsqueeze(0)
@@ -668,7 +702,7 @@ class LMTTSModel(nn.Module):
             chunk_mask = torch.ones(1, self.patch_size, device=prefix_embeds.device, dtype=torch.bool)
 
             if patch_idx == 0:
-                history = prompt_frames[-self.patch_size :]
+                history = prompt_frames[:0]
             else:
                 history = generated_fine[-self.patch_size :]
             history_padded = prompt_frames.new_zeros(1, self.patch_size, self.latent_dim)
@@ -679,6 +713,7 @@ class LMTTSModel(nn.Module):
 
             pred_patch = self.flow.sample(
                 cond_tokens=cond_tokens,
+                speaker_cond=speaker_cond,
                 history_fine_latents=history_padded,
                 history_mask=history_mask,
                 chunk_mask=chunk_mask,

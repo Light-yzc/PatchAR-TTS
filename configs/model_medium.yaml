@@ -32,7 +32,7 @@ model:
   dit_dropout: 0.0
 
   sigma_min: 1.0e-5
-  cond_dropout_prob: 0.1
+  cond_dropout_prob: 0.0
   flow_solver: euler
 
 audio:

@@ -121,11 +121,11 @@ class DiTBlock(nn.Module):
         latent_mask: torch.Tensor,
         cond_tokens: torch.Tensor,
         cond_mask: torch.Tensor,
-        time_cond: torch.Tensor,
+        adaln_cond: torch.Tensor,
         current_length: int,
     ) -> torch.Tensor:
-        # One time embedding produces the affine parameters and residual gates
-        # for self-attn, cross-attn, and FFN inside this block.
+        # One fused conditioning vector produces the affine parameters and
+        # residual gates for self-attn, cross-attn, and FFN inside this block.
         (
             self_shift,
             self_scale,
@@ -136,7 +136,7 @@ class DiTBlock(nn.Module):
             ffn_shift,
             ffn_scale,
             ffn_gate,
-        ) = self.ada_proj(time_cond).chunk(9, dim=-1)
+        ) = self.ada_proj(adaln_cond).chunk(9, dim=-1)
 
         x = modulate(self.self_norm(latent_tokens), self_shift, self_scale)
         self_attn_out, _ = self.self_attn(
@@ -206,6 +206,11 @@ class PatchDiT(nn.Module):
         self.time_embed = SinusoidalEmbedding(config.model_dim)
         self.time_mlp = nn.Sequential(
             nn.Linear(config.model_dim, config.model_dim),
+            nn.SiLU(),
+            nn.Linear(config.model_dim, config.model_dim),
+        )
+        self.adaln_cond_fuse = nn.Sequential(
+            nn.Linear(config.model_dim * 2, config.model_dim),
             nn.SiLU(),
             nn.Linear(config.model_dim, config.model_dim),
         )
@@ -296,6 +301,7 @@ class PatchDiT(nn.Module):
         noisy_fine_chunk: torch.Tensor,
         timesteps: torch.Tensor,
         cond_tokens: torch.Tensor,
+        speaker_cond: torch.Tensor | None = None,
         history_fine_latents: torch.Tensor | None = None,
         history_mask: torch.Tensor | None = None,
         chunk_mask: torch.Tensor | None = None,
@@ -347,6 +353,13 @@ class PatchDiT(nn.Module):
 
         current_tokens = self.latent_proj(noisy_fine_chunk)
         time_cond = self.time_mlp(self.time_embed(timesteps))
+        if speaker_cond is None:
+            speaker_cond = torch.zeros(batch_size, self.model_dim, device=noisy_fine_chunk.device, dtype=current_tokens.dtype)
+        else:
+            if speaker_cond.shape != (batch_size, self.model_dim):
+                raise ValueError(f"speaker_cond must have shape {(batch_size, self.model_dim)}")
+            speaker_cond = speaker_cond.to(device=noisy_fine_chunk.device, dtype=current_tokens.dtype)
+        adaln_cond = self.adaln_cond_fuse(torch.cat([time_cond, speaker_cond], dim=-1))
 
         # The DiT sequence is [history fine tokens | current noisy fine tokens].
         latent_tokens = torch.cat([history_tokens, current_tokens], dim=1)
@@ -363,7 +376,7 @@ class PatchDiT(nn.Module):
                     latent_mask,
                     cond_seq,
                     cond_mask,
-                    time_cond,
+                    adaln_cond,
                     chunk_size,
                     use_reentrant=False,
                 )
@@ -373,7 +386,7 @@ class PatchDiT(nn.Module):
                     latent_mask=latent_mask,
                     cond_tokens=cond_seq,
                     cond_mask=cond_mask,
-                    time_cond=time_cond,
+                    adaln_cond=adaln_cond,
                     current_length=chunk_size,
                 )
 
@@ -405,6 +418,7 @@ class ConditionalFlowMatching(nn.Module):
         self,
         target_chunk: torch.Tensor,
         cond_tokens: torch.Tensor,
+        speaker_cond: torch.Tensor | None = None,
         history_fine_latents: torch.Tensor | None = None,
         history_mask: torch.Tensor | None = None,
         chunk_mask: torch.Tensor | None = None,
@@ -431,6 +445,7 @@ class ConditionalFlowMatching(nn.Module):
             noisy_fine_chunk=x_t,
             timesteps=timesteps,
             cond_tokens=self._maybe_dropout_cond(cond_tokens),
+            speaker_cond=speaker_cond,
             history_fine_latents=history_fine_latents,
             history_mask=history_mask,
             chunk_mask=chunk_mask,
@@ -447,6 +462,7 @@ class ConditionalFlowMatching(nn.Module):
         noisy_fine_chunk: torch.Tensor,
         timesteps: torch.Tensor,
         cond_tokens: torch.Tensor,
+        speaker_cond: torch.Tensor | None,
         history_fine_latents: torch.Tensor | None,
         history_mask: torch.Tensor | None,
         chunk_mask: torch.Tensor | None,
@@ -457,6 +473,7 @@ class ConditionalFlowMatching(nn.Module):
                 noisy_fine_chunk=noisy_fine_chunk,
                 timesteps=timesteps,
                 cond_tokens=cond_tokens,
+                speaker_cond=speaker_cond,
                 history_fine_latents=history_fine_latents,
                 history_mask=history_mask,
                 chunk_mask=chunk_mask,
@@ -467,6 +484,9 @@ class ConditionalFlowMatching(nn.Module):
         noisy_pair = torch.cat([noisy_fine_chunk, noisy_fine_chunk], dim=0)
         timestep_pair = torch.cat([timesteps, timesteps], dim=0)
         cond_pair = torch.cat([cond_tokens, zeros_cond], dim=0)
+        speaker_pair = None
+        if speaker_cond is not None:
+            speaker_pair = torch.cat([speaker_cond, speaker_cond], dim=0)
 
         history_pair = None
         if history_fine_latents is not None:
@@ -484,6 +504,7 @@ class ConditionalFlowMatching(nn.Module):
             noisy_fine_chunk=noisy_pair,
             timesteps=timestep_pair,
             cond_tokens=cond_pair,
+            speaker_cond=speaker_pair,
             history_fine_latents=history_pair,
             history_mask=history_mask_pair,
             chunk_mask=chunk_mask_pair,
@@ -495,6 +516,7 @@ class ConditionalFlowMatching(nn.Module):
     def sample(
         self,
         cond_tokens: torch.Tensor,
+        speaker_cond: torch.Tensor | None = None,
         history_fine_latents: torch.Tensor | None = None,
         history_mask: torch.Tensor | None = None,
         chunk_mask: torch.Tensor | None = None,
@@ -528,6 +550,7 @@ class ConditionalFlowMatching(nn.Module):
                 noisy_fine_chunk=sample,
                 timesteps=t_now,
                 cond_tokens=cond_tokens,
+                speaker_cond=speaker_cond,
                 history_fine_latents=history_fine_latents,
                 history_mask=history_mask,
                 chunk_mask=chunk_mask,
