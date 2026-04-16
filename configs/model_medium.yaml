@@ -34,6 +34,8 @@ model:
   sigma_min: 1.0e-5
   cond_dropout_prob: 0.0
   flow_solver: euler
+  flow_loss_type: huber
+  flow_huber_delta: 0.1
 
 audio:
   latent_rate: 25
@@ -55,15 +57,15 @@ training:
 
   epochs: 1000000
   max_steps: 500000
-  learning_rate: 1.0e-4
-  lm_learning_rate: 5.0e-5
-  dit_learning_rate: 1.0e-4
-  head_learning_rate: 1.0e-4
+  learning_rate: 1.875e-4
+  lm_learning_rate: 1.875e-4
+  dit_learning_rate: 1.875e-4
+  head_learning_rate: 1.875e-4
   optimizer: adamw8bit
   weight_decay: 1.0e-2
   adam_beta1: 0.9
   adam_beta2: 0.95
-  warmup_steps: 2000
+  warmup_steps: 25000
   gradient_clip: 1.0
   precision: bf16
   gradient_checkpointing: false

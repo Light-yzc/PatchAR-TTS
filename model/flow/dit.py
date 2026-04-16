@@ -35,6 +35,8 @@ class FlowMatchingConfig:
     t_scheduler: str = "log-norm"
     log_norm_mu: float = -0.4
     log_norm_sigma: float = 1.0
+    loss_type: str = "mse"
+    huber_delta: float = 0.1
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -406,6 +408,23 @@ class ConditionalFlowMatching(nn.Module):
         self.estimator = estimator
         self.config = config or FlowMatchingConfig()
 
+    def _per_frame_loss(
+        self,
+        pred_velocity: torch.Tensor,
+        target_velocity: torch.Tensor,
+    ) -> torch.Tensor:
+        loss_type = self.config.loss_type.lower()
+        if loss_type == "mse":
+            return F.mse_loss(pred_velocity, target_velocity, reduction="none").mean(dim=-1)
+        if loss_type == "huber":
+            return F.huber_loss(
+                pred_velocity,
+                target_velocity,
+                reduction="none",
+                delta=self.config.huber_delta,
+            ).mean(dim=-1)
+        raise ValueError(f"Unsupported flow loss_type={self.config.loss_type!r}")
+
     def _maybe_dropout_cond(self, cond_tokens: torch.Tensor) -> torch.Tensor:
         if not self.training or self.config.cond_dropout_prob <= 0:
             return cond_tokens
@@ -451,7 +470,7 @@ class ConditionalFlowMatching(nn.Module):
             chunk_mask=chunk_mask,
         )
 
-        per_frame_loss = F.mse_loss(pred_velocity, target_velocity, reduction="none").mean(dim=-1)
+        per_frame_loss = self._per_frame_loss(pred_velocity, target_velocity)
         if chunk_mask is not None:
             chunk_weight = chunk_mask.to(device=target_chunk.device, dtype=per_frame_loss.dtype)
             return (per_frame_loss * chunk_weight).sum() / chunk_weight.sum().clamp_min(1.0)

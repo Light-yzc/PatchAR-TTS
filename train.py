@@ -218,6 +218,8 @@ def build_model(
         sigma_min=model_cfg.get("sigma_min", 1e-5),
         cond_dropout_prob=model_cfg.get("cond_dropout_prob", 0.1),
         solver=model_cfg.get("flow_solver", "euler"),
+        loss_type=model_cfg.get("flow_loss_type", "mse"),
+        huber_delta=float(model_cfg.get("flow_huber_delta", 0.1)),
     )
 
     return LMTTSModel(
@@ -748,6 +750,9 @@ def resolve_training_precision(train_cfg: dict, device: torch.device) -> tuple[s
 
 def train(args: argparse.Namespace) -> None:
     """Main training entrypoint used by the CLI below."""
+    if args.resume_step is not None and args.resume is None:
+        raise ValueError("--resume_step requires --resume.")
+
     cfg = load_config(args.config)
     device = pick_device(args.device)
     set_seed(int(cfg["training"].get("seed", 42)))
@@ -847,6 +852,10 @@ def train(args: argparse.Namespace) -> None:
     start_epoch = 0
     wandb_run_id = None
     scheduler_state_restored = False
+    effective_resume_step = args.resume_step
+    if args.reinit_dit and effective_resume_step is None:
+        effective_resume_step = 0
+        print("--reinit_dit: defaulting resume_step to 0 so the fresh DiT restarts its LR schedule.")
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
         global_step, start_epoch, wandb_run_id, scheduler_state_restored = load_checkpoint(
@@ -859,8 +868,17 @@ def train(args: argparse.Namespace) -> None:
             resume_optimizer_state=not (args.no_resume_optimizer or args.reinit_dit),
             reinit_dit=args.reinit_dit,
         )
-        print(f"Resumed at step {global_step}, epoch {start_epoch}")
-        if global_step > 0 and (args.no_resume_optimizer or not scheduler_state_restored):
+        if effective_resume_step is not None:
+            global_step = int(effective_resume_step)
+            start_epoch = 0
+            scheduler = build_scheduler(optimizer, cfg)
+            scheduler_state_restored = False
+            if global_step > 0:
+                fast_forward_scheduler(scheduler, global_step)
+            print(f"Resumed weights with overridden step {global_step}, epoch reset to {start_epoch}")
+        else:
+            print(f"Resumed at step {global_step}, epoch {start_epoch}")
+        if effective_resume_step is None and global_step > 0 and (args.no_resume_optimizer or not scheduler_state_restored):
             fast_forward_scheduler(scheduler, global_step)
             print(f"Scheduler fast-forwarded to step {global_step} using the current optimizer groups.")
 
@@ -1082,6 +1100,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_root", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint.pt")
+    parser.add_argument(
+        "--resume_step",
+        type=int,
+        default=None,
+        help="Override the resumed global step. Useful when reusing weights but restarting or rewinding the LR schedule.",
+    )
     parser.add_argument(
         "--no_resume_optimizer",
         action="store_true",
