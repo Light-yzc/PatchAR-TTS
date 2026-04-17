@@ -1057,7 +1057,6 @@ def train(args: argparse.Namespace) -> None:
                     f"head_lr={metrics['train/lr_head']:.2e}"
                 )
                 progress_bar.set_postfix_str(message)
-                print(message)
                 if wandb_run is not None:
                     wandb_run.log(metrics, step=global_step)
 
