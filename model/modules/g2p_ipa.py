@@ -21,6 +21,7 @@ Supports batch processing for vocab building.
 
 import re
 from functools import lru_cache
+from tqdm.auto import tqdm
 
 try:
     from phonemizer.separator import Separator
@@ -74,6 +75,18 @@ LANG_MAP = {
 # diphthongs intact instead of splitting the IPA string character by character.
 IPA_SEP = Separator(phone=" ", word=" | ", syllable="") if HAS_PHONEMIZER else None
 
+# Keep punctuation as standalone raw tokens in the text stream instead of
+# letting phonemizer glue them to neighboring phoneme units.
+PRESERVED_PUNCTUATION = {
+    "，", "。", "！", "？", "、", "；", "：",
+    ",", ".", "!", "?", ";", ":",
+    "…", "—",
+    "（", "）", "(", ")",
+    "“", "”", "\"",
+    "「", "」", "『", "』",
+}
+LANG_SWITCH_RE = re.compile(r"\((?:en(?:-us)?|ja|zh|cmn)\)", re.IGNORECASE)
+
 # ─── Persistent backend singletons ──────────────────────────────────
 # Key optimization: reuse backend instances instead of creating new ones.
 # Each EspeakBackend loads libespeak-ng.so and allocates memory.
@@ -86,7 +99,7 @@ def _get_backend(lang_code: str) -> "EspeakBackend":
     if lang_code not in _BACKENDS:
         _BACKENDS[lang_code] = EspeakBackend(
             language=lang_code,
-            preserve_punctuation=True,
+            preserve_punctuation=False,
             with_stress=False,
             words_mismatch='ignore'  
         )
@@ -95,7 +108,62 @@ def _get_backend(lang_code: str) -> "EspeakBackend":
 
 def _normalize_phoneme_units(text: str) -> str:
     """Collapse repeated whitespace while keeping '|' as a standalone word token."""
+    text = LANG_SWITCH_RE.sub(" ", text)
     return " ".join(text.split())
+
+
+def _split_text_for_g2p(text: str) -> list[tuple[str, str]]:
+    """Split raw text into pronounceable spans and standalone punctuation tokens."""
+    parts: list[tuple[str, str]] = []
+    current_chars: list[str] = []
+
+    def flush_text() -> None:
+        if current_chars:
+            parts.append(("text", "".join(current_chars)))
+            current_chars.clear()
+
+    for char in text:
+        if char.isspace():
+            flush_text()
+            continue
+        if char in PRESERVED_PUNCTUATION:
+            flush_text()
+            parts.append(("punct", char))
+            continue
+        current_chars.append(char)
+
+    flush_text()
+    return parts
+
+
+def _prepare_segment_texts(texts: list[str], language: str) -> tuple[list[list[tuple[str, str]]], list[str]]:
+    """Split texts and collect pronounceable spans for one-language batch G2P."""
+    segmented_texts = [_split_text_for_g2p(text) for text in texts]
+    text_segments = [value for segments in segmented_texts for kind, value in segments if kind == "text"]
+    if language.upper() == "JA":
+        text_segments = [_ja_kanji_to_kana(segment) for segment in text_segments]
+    return segmented_texts, text_segments
+
+
+def _stitch_phoneme_units(
+    segmented_texts: list[list[tuple[str, str]]],
+    phoneme_segments: list[str],
+) -> list[str]:
+    """Reinsert raw punctuation tokens between phoneme-unit spans."""
+    stitched: list[str] = []
+    phoneme_idx = 0
+    for segments in segmented_texts:
+        units: list[str] = []
+        for kind, value in segments:
+            if kind == "punct":
+                units.append(value)
+                continue
+            phoneme_text = phoneme_segments[phoneme_idx]
+            phoneme_idx += 1
+            if phoneme_text:
+                units.extend(phoneme_text.split())
+        stitched.append(" ".join(units))
+    return stitched
 
 
 # ─── Core functions ─────────────────────────────────────────────────
@@ -121,16 +189,11 @@ def g2p_ipa(text: str, language: str) -> str:
     if lang_code is None:
         raise ValueError(f"Unsupported language: {language}. Supported: {list(LANG_MAP.keys())}")
 
-    if lang_code == "ja":
-        text = _ja_kanji_to_kana(text)
-
-    backend = _get_backend(lang_code)
-    # Use the backend's phonemize method directly (no new backend creation!)
-    result = backend.phonemize([text], separator=IPA_SEP, strip=True)
-    return _normalize_phoneme_units(result[0]) if result else ""
+    result = g2p_ipa_batch([text], language, chunk_size=1)
+    return result[0] if result else ""
 
 
-def g2p_ipa_batch(texts: list[str], language: str) -> list[str]:
+def g2p_ipa_batch(texts: list[str], language: str, chunk_size: int = 256) -> list[str]:
     """
     Batch convert texts to IPA. Much more efficient than calling g2p_ipa()
     in a loop because espeak-ng processes the entire batch in one subprocess call.
@@ -146,16 +209,32 @@ def g2p_ipa_batch(texts: list[str], language: str) -> list[str]:
         return []
     if not HAS_PHONEMIZER:
         raise ImportError("Please install phonemizer + espeak-ng")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
 
     lang_code = LANG_MAP.get(language.upper())
     if lang_code is None:
         raise ValueError(f"Unsupported language: {language}")
 
-    if lang_code == "ja":
-        texts = [_ja_kanji_to_kana(t) for t in texts]
+    segmented_texts, text_segments = _prepare_segment_texts(texts, language)
+    if not text_segments:
+        return _stitch_phoneme_units(segmented_texts, [])
 
     backend = _get_backend(lang_code)
-    return [_normalize_phoneme_units(item) for item in backend.phonemize(texts, separator=IPA_SEP, strip=True)]
+    phoneme_segments: list[str] = []
+    chunk_starts = range(0, len(text_segments), chunk_size)
+    for start in tqdm(
+        chunk_starts,
+        total=(len(text_segments) + chunk_size - 1) // chunk_size,
+        desc=f"G2P {language.upper()}",
+        unit="chunk",
+    ):
+        chunk = text_segments[start : start + chunk_size]
+        phoneme_segments.extend(
+            _normalize_phoneme_units(item)
+            for item in backend.phonemize(chunk, separator=IPA_SEP, strip=True)
+        )
+    return _stitch_phoneme_units(segmented_texts, phoneme_segments)
 
 
 def text_to_phonemes_ipa(text: str, language: str) -> str:
