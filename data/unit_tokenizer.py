@@ -182,7 +182,7 @@ class UnitTokenizer:
         mapped_cache: dict[int, str] = {}
         for language, texts in grouped_texts.items():
             try:
-                batch_ipa = g2p_ipa_batch(texts, language)
+                batch_ipa = g2p_ipa_batch(texts, language, show_progress=True)
                 mapped_texts = [f"[{language}] {ipa}" if ipa else f"[{language}]" for ipa in batch_ipa]
             except Exception:
                 mapped_texts = [text_to_phonemes_ipa(text, language) for text in texts]

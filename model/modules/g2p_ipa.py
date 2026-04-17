@@ -193,7 +193,12 @@ def g2p_ipa(text: str, language: str) -> str:
     return result[0] if result else ""
 
 
-def g2p_ipa_batch(texts: list[str], language: str, chunk_size: int = 256) -> list[str]:
+def g2p_ipa_batch(
+    texts: list[str],
+    language: str,
+    chunk_size: int = 256,
+    show_progress: bool = False,
+) -> list[str]:
     """
     Batch convert texts to IPA. Much more efficient than calling g2p_ipa()
     in a loop because espeak-ng processes the entire batch in one subprocess call.
@@ -228,6 +233,7 @@ def g2p_ipa_batch(texts: list[str], language: str, chunk_size: int = 256) -> lis
         total=(len(text_segments) + chunk_size - 1) // chunk_size,
         desc=f"G2P {language.upper()}",
         unit="chunk",
+        disable=not show_progress,
     ):
         chunk = text_segments[start : start + chunk_size]
         phoneme_segments.extend(
