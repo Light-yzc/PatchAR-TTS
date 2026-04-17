@@ -16,7 +16,7 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.char_tokenizer import CharTokenizer
+from data.unit_tokenizer import UnitTokenizer
 from data.dataset import TTSDataset, TTSDatasetLoRA, collate_fn
 from model.backbones.base_lm import MiniMindConfig
 from model.flow.dit import DiTConfig, FlowMatchingConfig
@@ -108,7 +108,7 @@ def resolve_vocab_path(cfg: dict, args: argparse.Namespace, data_root: str) -> P
     vocab_path = cfg.get("data", {}).get("vocab_path")
     if vocab_path:
         return Path(vocab_path)
-    return Path(data_root) / "char_vocab.json"
+    return Path(data_root) / "phoneme_unit_vocab.json"
 
 
 def build_tokenizer(
@@ -117,26 +117,26 @@ def build_tokenizer(
     data_root: str,
     output_dir: Path,
     args: argparse.Namespace,
-) -> tuple[CharTokenizer, Path]:
-    """Load an existing char vocab or build one from dataset samples as a fallback."""
+) -> tuple[UnitTokenizer, Path]:
+    """Load an existing phoneme-unit vocab or build one from dataset samples as a fallback."""
     vocab_path = resolve_vocab_path(cfg, args, data_root)
 
     if vocab_path.exists():
-        tokenizer = CharTokenizer.load(vocab_path)
-        print(f"Loaded char vocab from {vocab_path} ({tokenizer.vocab_size} tokens)")
+        tokenizer = UnitTokenizer.load(vocab_path)
+        print(f"Loaded phoneme-unit vocab from {vocab_path} ({tokenizer.vocab_size} tokens)")
     else:
         print(f"Vocab not found at {vocab_path}, building from dataset...")
-        tokenizer = CharTokenizer.build_from_dataset_samples(dataset.samples)
+        tokenizer = UnitTokenizer.build_from_dataset_samples(dataset.samples)
         vocab_path.parent.mkdir(parents=True, exist_ok=True)
         tokenizer.save(vocab_path)
-        print(f"Built and saved char vocab to {vocab_path} ({tokenizer.vocab_size} tokens)")
+        print(f"Built and saved phoneme-unit vocab to {vocab_path} ({tokenizer.vocab_size} tokens)")
 
-    output_vocab_path = output_dir / "char_vocab.json"
+    output_vocab_path = output_dir / vocab_path.name
     tokenizer.save(output_vocab_path)
     return tokenizer, output_vocab_path
 
 
-def resolve_audio_special_token_ids(tokenizer: CharTokenizer) -> dict[str, int]:
+def resolve_audio_special_token_ids(tokenizer: UnitTokenizer) -> dict[str, int]:
     missing_tokens = [
         token
         for token in (PROMPT_AUDIO_START_TOKEN, TARGET_AUDIO_START_TOKEN)
@@ -404,7 +404,7 @@ def init_wandb(cfg: dict, output_dir: Path, resume_id: str | None = None):
 def run_periodic_inference(
     model: LMTTSModel,
     batch: dict,
-    tokenizer: CharTokenizer,
+    tokenizer: UnitTokenizer,
     cfg: dict,
     device: torch.device,
     global_step: int,
@@ -1113,7 +1113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--reinit_dit", action="store_true",
                         help="Reinitialize DiT weights (with AdaLN-Zero) while keeping trained LM weights.")
-    parser.add_argument("--vocab", type=str, default=None, help="Path to char_vocab.json")
+    parser.add_argument("--vocab", type=str, default=None, help="Path to phoneme_unit_vocab.json")
     parser.add_argument("--device", type=str, default=None)
     return parser
 

@@ -46,7 +46,7 @@ audio:
 
 data:
   dataset_type: default
-  vocab_path: data/char_vocab.json
+  vocab_path: data/phoneme_unit_vocab.json
   max_text_len: 512
 
 training:

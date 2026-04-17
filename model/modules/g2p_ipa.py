@@ -65,13 +65,14 @@ def _ja_kanji_to_kana(text: str) -> str:
 
 # ─── Language code mapping ───────────────────────────────────────────
 LANG_MAP = {
-    "ZH": "cmn",       # Mandarin Chinese
+    "ZH": "cmn",        # Mandarin Chinese
     "JA": "ja",         # Japanese
     "EN": "en-us",      # American English
 }
 
-# Compact IPA separator: space between words, nothing between phones
-IPA_SEP = Separator(phone="", word=" ", syllable="") if HAS_PHONEMIZER else None
+# Emit explicit phone units so downstream tokenization can keep affricates /
+# diphthongs intact instead of splitting the IPA string character by character.
+IPA_SEP = Separator(phone=" ", word=" | ", syllable="") if HAS_PHONEMIZER else None
 
 # ─── Persistent backend singletons ──────────────────────────────────
 # Key optimization: reuse backend instances instead of creating new ones.
@@ -92,6 +93,11 @@ def _get_backend(lang_code: str) -> "EspeakBackend":
     return _BACKENDS[lang_code]
 
 
+def _normalize_phoneme_units(text: str) -> str:
+    """Collapse repeated whitespace while keeping '|' as a standalone word token."""
+    return " ".join(text.split())
+
+
 # ─── Core functions ─────────────────────────────────────────────────
 
 def g2p_ipa(text: str, language: str) -> str:
@@ -103,7 +109,7 @@ def g2p_ipa(text: str, language: str) -> str:
         language: "ZH", "JA", or "EN"
 
     Returns:
-        IPA string, e.g. "tɕintʰjɛn tʰjɛntɕʰi tʂənxau"
+        Space-delimited phone units, e.g. "tɕ in tʰ jɛn | tʰ jɛn tɕʰ i"
     """
     if not HAS_PHONEMIZER:
         raise ImportError(
@@ -121,7 +127,7 @@ def g2p_ipa(text: str, language: str) -> str:
     backend = _get_backend(lang_code)
     # Use the backend's phonemize method directly (no new backend creation!)
     result = backend.phonemize([text], separator=IPA_SEP, strip=True)
-    return result[0] if result else ""
+    return _normalize_phoneme_units(result[0]) if result else ""
 
 
 def g2p_ipa_batch(texts: list[str], language: str) -> list[str]:
@@ -149,21 +155,21 @@ def g2p_ipa_batch(texts: list[str], language: str) -> list[str]:
         texts = [_ja_kanji_to_kana(t) for t in texts]
 
     backend = _get_backend(lang_code)
-    return backend.phonemize(texts, separator=IPA_SEP, strip=True)
+    return [_normalize_phoneme_units(item) for item in backend.phonemize(texts, separator=IPA_SEP, strip=True)]
 
 
 def text_to_phonemes_ipa(text: str, language: str) -> str:
     """
     Drop-in replacement for text_to_phonemes() in g2p.py.
-    Converts text to IPA and prepends a language tag.
+    Converts text to IPA phone units and prepends a language tag.
 
     Example:
         text_to_phonemes_ipa("今天天气真好", "ZH")
-        → "[ZH] tɕintʰjɛn tʰjɛntɕʰi tʂənxau"
+        → "[ZH] tɕ in tʰ jɛn | tʰ jɛn tɕʰ i"
     """
     language = language.upper()
     ipa = g2p_ipa(text, language)
-    return f"[{language}] {ipa}"
+    return f"[{language}] {ipa}" if ipa else f"[{language}]"
 
 
 # ─── Demo ───────────────────────────────────────────────────────────
