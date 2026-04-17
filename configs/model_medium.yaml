@@ -34,7 +34,7 @@ model:
   sigma_min: 1.0e-5
   cond_dropout_prob: 0.0
   flow_solver: euler
-  flow_loss_type: huber
+  flow_loss_type: mse
   flow_huber_delta: 0.1
 
 audio:
