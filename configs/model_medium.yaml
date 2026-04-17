@@ -1,5 +1,6 @@
 model:
   latent_dim: 64
+  vocab_size: 512
 
   hidden_size: 1024
   # Sub-1B LM target: keep 8 experts, reduce depth by one layer.

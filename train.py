@@ -152,6 +152,20 @@ def resolve_audio_special_token_ids(tokenizer: UnitTokenizer) -> dict[str, int]:
     }
 
 
+def resolve_model_vocab_size(cfg: dict, tokenizer: UnitTokenizer) -> int:
+    model_cfg = cfg.get("model", {})
+    configured_vocab_size = model_cfg.get("vocab_size")
+    if configured_vocab_size is None:
+        return tokenizer.vocab_size
+
+    vocab_size = int(configured_vocab_size)
+    if vocab_size < tokenizer.vocab_size:
+        raise ValueError(
+            f"Configured model.vocab_size={vocab_size} is smaller than tokenizer vocab_size={tokenizer.vocab_size}"
+        )
+    return vocab_size
+
+
 def build_model(
     cfg: dict,
     latent_dim: int,
@@ -806,10 +820,11 @@ def train(args: argparse.Namespace) -> None:
     example = dataset[0]
     latent_dim = int(example["target_latent"].shape[-1])
     audio_special_token_ids = resolve_audio_special_token_ids(tokenizer)
+    model_vocab_size = resolve_model_vocab_size(cfg, tokenizer)
     model = build_model(
         cfg,
         latent_dim=latent_dim,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=model_vocab_size,
         audio_special_token_ids=audio_special_token_ids,
     ).to(device)
     gradient_checkpointing = bool(train_cfg.get("gradient_checkpointing", False))
@@ -831,6 +846,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Device: {device}")
     print(f"Dataset: {len(dataset)} samples")
     print(f"Tokenizer vocab: {tokenizer.vocab_size}")
+    print(f"Model vocab: {model_vocab_size}")
     print(
         "Audio token ids: "
         f"{PROMPT_AUDIO_START_TOKEN}={audio_special_token_ids['prompt_audio_start']}, "
