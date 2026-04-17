@@ -94,6 +94,17 @@ LANG_SWITCH_RE = re.compile(r"\((?:en(?:-us)?|ja|zh|cmn)\)", re.IGNORECASE)
 _BACKENDS: dict[str, "EspeakBackend"] = {}
 
 
+@lru_cache(maxsize=1)
+def _get_silent_phonemizer_logger() -> logging.Logger:
+    """Return a dedicated phonemizer logger that never emits training-time warnings."""
+    logger = logging.getLogger("phonemizer.silent")
+    logger.handlers = [logging.NullHandler()]
+    logger.setLevel(logging.CRITICAL)
+    logger.propagate = False
+    logger.disabled = True
+    return logger
+
+
 def _get_backend(lang_code: str) -> "EspeakBackend":
     """Get or create a persistent EspeakBackend for the given language."""
     if lang_code not in _BACKENDS:
@@ -101,7 +112,8 @@ def _get_backend(lang_code: str) -> "EspeakBackend":
             language=lang_code,
             preserve_punctuation=False,
             with_stress=False,
-            words_mismatch='ignore'  
+            words_mismatch='ignore',
+            logger=_get_silent_phonemizer_logger(),
         )
     return _BACKENDS[lang_code]
 
