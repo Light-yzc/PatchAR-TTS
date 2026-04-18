@@ -253,22 +253,36 @@ def build_model(
     )
 
 
-def _iter_trainable_params(*items) -> list[torch.nn.Parameter]:
-    params: list[torch.nn.Parameter] = []
+def _iter_named_trainable_params(*items: tuple[str, object]) -> list[tuple[str, torch.nn.Parameter]]:
+    named_params: list[tuple[str, torch.nn.Parameter]] = []
     seen: set[int] = set()
-    for item in items:
+    for prefix, item in items:
         if item is None:
             continue
         if isinstance(item, torch.nn.Parameter):
             if item.requires_grad and id(item) not in seen:
-                params.append(item)
+                named_params.append((prefix, item))
                 seen.add(id(item))
             continue
-        for param in item.parameters():
-            if param.requires_grad and id(param) not in seen:
-                params.append(param)
+        if isinstance(item, torch.nn.Module):
+            for name, param in item.named_parameters():
+                if not param.requires_grad or id(param) in seen:
+                    continue
+                full_name = f"{prefix}.{name}" if prefix else name
+                named_params.append((full_name, param))
                 seen.add(id(param))
-    return params
+            continue
+        raise TypeError(f"Unsupported trainable item type: {type(item)!r}")
+    return named_params
+
+
+def _use_no_decay(param_name: str, param: torch.nn.Parameter) -> bool:
+    lower_name = param_name.lower()
+    if param.ndim <= 1:
+        return True
+    if lower_name.endswith(".bias") or lower_name == "bias":
+        return True
+    return "norm" in lower_name
 
 
 def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch.optim.Optimizer:
@@ -292,40 +306,55 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
     seen: set[int] = set()
     param_groups: list[dict] = []
 
-    def add_group(name: str, group_lr: float, params: list[torch.nn.Parameter]) -> None:
-        unique_params = []
-        for param in params:
+    def add_group(name: str, group_lr: float, named_params: list[tuple[str, torch.nn.Parameter]]) -> None:
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+        for param_name, param in named_params:
             if id(param) in seen:
                 continue
             seen.add(id(param))
-            unique_params.append(param)
-        if unique_params:
+            if _use_no_decay(param_name, param):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+        if decay_params:
             param_groups.append(
                 {
-                    "name": name,
-                    "params": unique_params,
+                    "name": f"{name}_decay",
+                    "params": decay_params,
                     "lr": group_lr,
                     "weight_decay": weight_decay,
                 }
             )
+        if no_decay_params:
+            param_groups.append(
+                {
+                    "name": f"{name}_no_decay",
+                    "params": no_decay_params,
+                    "lr": group_lr,
+                    "weight_decay": 0.0,
+                }
+            )
 
-    add_group("lm", lm_lr, _iter_trainable_params(model.base_lm))
-    add_group("dit", dit_lr, _iter_trainable_params(model.dit))
+    add_group("lm", lm_lr, _iter_named_trainable_params(("base_lm", model.base_lm)))
+    add_group("dit", dit_lr, _iter_named_trainable_params(("dit", model.dit)))
     add_group(
         "heads",
         head_lr,
-        _iter_trainable_params(
-            model.patch_encoder,
-            model.cond_slot_proj,
-            model.speaker_attn_score,
-            model.speaker_proj,
-            model.stop_proj,
-            model.stop_head,
-            model.cond_slot_embed,
-            model.cond_type_embed,
+        _iter_named_trainable_params(
+            ("patch_encoder", model.patch_encoder),
+            ("cond_slot_proj", model.cond_slot_proj),
+            ("speaker_attn_score", model.speaker_attn_score),
+            ("speaker_proj", model.speaker_proj),
+            ("stop_proj", model.stop_proj),
+            ("stop_head", model.stop_head),
+            ("cond_slot_embed", model.cond_slot_embed),
+            ("cond_type_embed", model.cond_type_embed),
         ),
     )
-    remaining_params = [param for param in model.parameters() if param.requires_grad and id(param) not in seen]
+    remaining_params = [
+        (name, param) for name, param in model.named_parameters() if param.requires_grad and id(param) not in seen
+    ]
     add_group("misc", head_lr, remaining_params)
 
     if optimizer_name == "adamw8bit":
