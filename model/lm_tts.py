@@ -198,6 +198,11 @@ class LMTTSModel(nn.Module):
         self.cond_slot_proj = nn.Linear(self.hidden_size, cond_tokens_per_patch * self.hidden_size)
         self.cond_slot_embed = nn.Parameter(torch.randn(1, cond_tokens_per_patch, self.hidden_size) * 0.02)
         self.cond_type_embed = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+        self.patch_lm_proj = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
         self.speaker_attn_score = nn.Linear(self.hidden_size, 1)
         self.speaker_proj = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
@@ -266,7 +271,10 @@ class LMTTSModel(nn.Module):
 
         cond_tokens = self.cond_slot_proj(patch_hidden)
         cond_tokens = cond_tokens.view(batch_size, num_steps, self.cond_tokens_per_patch, self.hidden_size)
-        cond_tokens = cond_tokens + self.cond_slot_embed.unsqueeze(1) + self.cond_type_embed.unsqueeze(1)
+        # Keep per-slot identity, but drop the global cond-type bias for now.
+        # This shared vector was getting repeated over every target patch and is
+        # a plausible source of overly concentrated gradients.
+        cond_tokens = cond_tokens + self.cond_slot_embed.unsqueeze(1)
         return cond_tokens
 
     def _hidden_zeros(self, *shape: int) -> torch.Tensor:
@@ -580,8 +588,11 @@ class LMTTSModel(nn.Module):
 
         patch_weight = target_patch_mask.to(dtype=hidden_states.dtype)
 
-        # patch_lm_loss removed — DiT gradients drive LM learning directly
-        patch_lm_loss = torch.tensor(0.0, device=hidden_states.device)
+        # A small auxiliary target on the patch embedding space gives the LM a
+        # more direct learning signal than relying only on DiT backprop.
+        patch_pred = self.patch_lm_proj(target_patch_hidden)
+        patch_lm_loss_per_step = F.mse_loss(patch_pred, target_patches, reduction="none").mean(dim=-1)
+        patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
 
         stop_logits = self.stop_head(self.stop_act(self.stop_proj(target_patch_hidden)))
         stop_labels = self._build_stop_labels(target_patch_mask)

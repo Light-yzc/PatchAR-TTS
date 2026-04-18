@@ -282,7 +282,15 @@ def _use_no_decay(param_name: str, param: torch.nn.Parameter) -> bool:
         return True
     if lower_name.endswith(".bias") or lower_name == "bias":
         return True
-    return "norm" in lower_name
+    if "norm" in lower_name:
+        return True
+    if "embed" in lower_name:
+        return True
+    if "summary_token" in lower_name:
+        return True
+    if lower_name.endswith("frame_pos") or ".frame_pos" in lower_name:
+        return True
+    return False
 
 
 def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch.optim.Optimizer:
@@ -344,6 +352,7 @@ def build_optimizer(model: LMTTSModel, cfg: dict, device: torch.device) -> torch
         _iter_named_trainable_params(
             ("patch_encoder", model.patch_encoder),
             ("cond_slot_proj", model.cond_slot_proj),
+            ("patch_lm_proj", model.patch_lm_proj),
             ("speaker_attn_score", model.speaker_attn_score),
             ("speaker_proj", model.speaker_proj),
             ("stop_proj", model.stop_proj),
