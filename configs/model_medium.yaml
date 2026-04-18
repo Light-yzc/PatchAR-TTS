@@ -99,7 +99,7 @@ inference:
 
 wandb:
   enabled: true
-  project: myvox_lm_tts_v2_long_lm_shorter_llm_length
+  project: myvox_lm_tts_v2_long_lm_shorter_llm_length_fix1
   mode: online
   name: null
   tags: []
