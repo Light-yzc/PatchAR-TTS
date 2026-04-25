@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import yaml
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from data.unit_tokenizer import UnitTokenizer
@@ -77,6 +77,19 @@ def count_parameters(module: torch.nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in module.parameters())
     trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
     return total, trainable
+
+
+class FixedItemsDataset(Dataset):
+    """A tiny materialized dataset used for single-batch architecture overfit tests."""
+
+    def __init__(self, items: list[dict]) -> None:
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self.items[idx]
 
 
 def build_dataset(cfg: dict, data_root: str):
@@ -418,6 +431,14 @@ def fast_forward_scheduler(scheduler: torch.optim.lr_scheduler.LambdaLR, step: i
     for param_group, lr in zip(scheduler.optimizer.param_groups, closed_form_lrs):
         param_group["lr"] = lr
     scheduler._last_lr = list(closed_form_lrs)
+
+
+def resolve_logged_group_lr(group_lrs: dict[str, float], prefix: str, fallback: float) -> float:
+    """Return the LR for a logical optimizer group that may have decay/no_decay splits."""
+    for group_name, lr in group_lrs.items():
+        if group_name == prefix or group_name.startswith(f"{prefix}_"):
+            return float(lr)
+    return float(fallback)
 
 
 def init_wandb(cfg: dict, output_dir: Path, resume_id: str | None = None):
@@ -821,6 +842,19 @@ def train(args: argparse.Namespace) -> None:
     cfg["training"]["output_dir"] = str(output_dir)
     if args.vocab is not None:
         cfg["data"]["vocab_path"] = args.vocab
+    if args.test_arch:
+        cfg["training"]["test_arch"] = True
+        wandb_cfg = cfg.setdefault("wandb", {})
+        base_run_name = wandb_cfg.get("name")
+        wandb_cfg["name"] = (
+            f"test_arch_{base_run_name}"
+            if base_run_name
+            else f"test_arch_bs{cfg['training'].get('batch_size', 'unknown')}"
+        )
+        wandb_tags = list(wandb_cfg.get("tags") or [])
+        if "test_arch" not in wandb_tags:
+            wandb_tags.append("test_arch")
+        wandb_cfg["tags"] = wandb_tags
 
     save_config(output_dir / "config_resolved.yaml", cfg)
     (output_dir / "cli_args.json").write_text(
@@ -836,19 +870,31 @@ def train(args: argparse.Namespace) -> None:
     data_cfg = cfg.get("data", {})
     train_cfg = cfg["training"]
 
+    if args.test_arch:
+        fixed_count = min(int(train_cfg["batch_size"]), len(dataset))
+        fixed_items = [dataset[idx] for idx in range(fixed_count)]
+        dataset = FixedItemsDataset(fixed_items)
+        print(
+            "--test_arch enabled: materialized the first "
+            f"{fixed_count} samples and will train on this fixed batch repeatedly."
+        )
+
     collate_with_tokenizer = partial(
         collate_fn,
         tokenizer=tokenizer,
         max_text_len=data_cfg.get("max_text_len", 512),
     )
+    loader_batch_size = len(dataset) if args.test_arch else train_cfg["batch_size"]
+    loader_num_workers = 0 if args.test_arch else train_cfg.get("num_workers", 0)
+    loader_drop_last = False if args.test_arch else train_cfg.get("drop_last", True)
     dataloader = DataLoader(
         dataset,
-        batch_size=train_cfg["batch_size"],
-        shuffle=True,
-        num_workers=train_cfg.get("num_workers", 0),
+        batch_size=loader_batch_size,
+        shuffle=not args.test_arch,
+        num_workers=loader_num_workers,
         collate_fn=collate_with_tokenizer,
         pin_memory=(device.type == "cuda"),
-        drop_last=train_cfg.get("drop_last", True),
+        drop_last=loader_drop_last,
     )
     if len(dataloader) == 0:
         raise ValueError(
@@ -1059,9 +1105,11 @@ def train(args: argparse.Namespace) -> None:
                     optimizer.param_groups[idx].get("name", f"group_{idx}"): float(value)
                     for idx, value in enumerate(lr_values)
                 }
-                lm_lr = group_lrs.get("lm", float(lr_values[0]))
-                dit_lr = group_lrs.get("dit", float(lr_values[0]))
-                head_lr = group_lrs.get("heads", group_lrs.get("misc", float(lr_values[0])))
+                default_lr = float(lr_values[0])
+                lm_lr = resolve_logged_group_lr(group_lrs, "lm", default_lr)
+                dit_lr = resolve_logged_group_lr(group_lrs, "dit", default_lr)
+                misc_lr = resolve_logged_group_lr(group_lrs, "misc", default_lr)
+                head_lr = resolve_logged_group_lr(group_lrs, "heads", misc_lr)
                 metrics = {
                     "train/loss": float(losses.loss.item()),
                     "train/lm_loss": float(losses.lm_loss.item()),
@@ -1168,6 +1216,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Reinitialize DiT weights (with AdaLN-Zero) while keeping trained LM weights.")
     parser.add_argument("--vocab", type=str, default=None, help="Path to phoneme_unit_vocab.json")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--test_arch",
+        action="store_true",
+        help="Overfit-test the architecture on a fixed materialized batch made from the first training.batch_size samples.",
+    )
     return parser
 
 

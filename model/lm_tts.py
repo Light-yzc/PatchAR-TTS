@@ -591,7 +591,7 @@ class LMTTSModel(nn.Module):
         # A small auxiliary target on the patch embedding space gives the LM a
         # more direct learning signal than relying only on DiT backprop.
         patch_pred = self.patch_lm_proj(target_patch_hidden)
-        patch_lm_loss_per_step = F.mse_loss(patch_pred, target_patches, reduction="none").mean(dim=-1)
+        patch_lm_loss_per_step = F.mse_loss(patch_pred, target_patches.detach(), reduction="none").mean(dim=-1)
         patch_lm_loss = (patch_lm_loss_per_step * patch_weight).sum() / patch_weight.sum().clamp_min(1.0)
 
         stop_logits = self.stop_head(self.stop_act(self.stop_proj(target_patch_hidden)))
